@@ -21,122 +21,157 @@ REQUIRES
 """
 import os, sys
 import logging, unittest
-from abc import ABC, abstractmethod, abstractproperty
-from typing import Union, Set, List, Iterable
-from .metadatabase import Product, Metadatabase, Resource
-from sqlalchemy.orm import Session
-from .goesr_pug import PugL1bTools
+from PyQt4.QtCore import QObject, pyqtSignal
+from typing import Union, Set, List, Iterable, Mapping
+from ..common import INFO
+from .workspace import Workspace
+from sift.queue import TASK_DOING, TASK_PROGRESS
+from datetime import datetime
+
 
 LOG = logging.getLogger(__name__)
 
-class aHunter(ABC):
+
+class _workspace_test_proxy(object):
+    def __init__(self):
+        self.cwd = '/tmp' if os.path.isdir("/tmp") else os.getcwd()
+
+    def collect_product_metadata_for_paths(self, paths):
+        LOG.debug("import metadata for files: {}".format(repr(paths)))
+        for path in paths:
+            yield 1, {INFO.PATHNAME: path}
+
+    class _emitsy(object):
+        def emit(self, stuff):
+            print("==> " + repr(stuff))
+
+    didUpdateProductsMetadata = _emitsy()
+
+
+class ResourceSearchPathCollector(QObject):
+    """Given a set of search paths,
+    awaken for new files available within the directories,
+    update the metadatabase for new resources,
+    and mark for purge any files no longer available.
     """
-    Hunter scans one or locations for metadata
-    """
-    _DB: Metadatabase = None
+    _ws: Workspace = None
+    _paths: List[str] = None
+    _dir_mtimes: Mapping[str, datetime] = None
+    _timestamp_path: str = None  # path which tracks the last time we skimmed the paths
+    _is_posix: bool = None
+    _scheduled_dirs: List[str] = None
+    _scheduled_files: List[str] = None
 
-    def __init__(self, db: Metadatabase):
-        self._DB = db
+    @property
+    def paths(self):
+        return list(self._paths)
 
-    def product_for(self, realpath:str, fullname:str):
+    @paths.setter
+    def paths(self, new_paths):
+        nu = set(new_paths)
+        ol = set(self._paths)
+        removed = ol - nu
+        added = nu - ol
+        self._scheduled_dirs = []
+        self._scheduled_files = []
+        self._paths = list(new_paths)
+        self._flush_dirs(removed)
+        self._schedule_walk_dirs(added)
+        LOG.debug('old search directories removed: {}'.format(':'.join(sorted(removed))))
+        LOG.debug('new search directories added: {}'.format(':'.join(sorted(added))))
+
+    def _flush_dirs(self, dirs: Iterable[str]):
+        pass
+
+    def _schedule_walk_dirs(self, dirs: Iterable[str]):
+        self._scheduled_dirs += list(dirs)
+
+    @property
+    def has_pending_files(self):
+        return len(self._scheduled_files)
+
+    def __bool__(self):
+        return len(self._paths) > 0
+
+    def _skim(self, last_checked: int = 0, dirs: Iterable[str] = None):
+        """skim directories for new mtimes
         """
-        check database to see if a given path + product name
-        Args:
-            realpath:
-            fullname:
+        skipped_dirs = 0
+        for rawpath in (dirs or self._paths):
+            path = os.path.abspath(rawpath)
+            if not os.path.isdir(path):
+                LOG.warning("{} is not a directory".format(path))
+                continue
+            for dirpath, dirnames, filenames in os.walk(path):
+                if self._is_posix and (os.stat(dirpath).st_mtime < last_checked):
+                    skipped_dirs += 1
+                    continue
+                for filename in filenames:
+                    if filename.startswith('.'):
+                        continue  # dammit Apple, ._*.nc files ...
+                    filepath = os.path.join(dirpath, filename)
+                    if os.path.isfile(filepath) and (os.stat(filepath).st_mtime >= last_checked):
+                        yield filepath
+        LOG.debug("skipped files in {} dirs due to POSIX directory mtime".format(skipped_dirs))
 
-        Returns:
-
-        """
-
-    @abstractmethod
-    def hunt_dir(self, S: Session, dir_path:str) -> int:
-        return 0
-
-    @abstractmethod
-    def hunt_file(self, S: Session, file_path:str) -> int:
-        return 0
-
-    def hunt_seq(self, S: Session, seq: Iterable[str]) -> int:
-        found = 0
-        for path in seq:
-            if os.path.isfile(path):
-                found += self.hunt_file(S, path)
-            elif os.path.isdir(path):
-                found += self.hunt_dir(S, path)
-            else:
-                raise ValueError('Unknown content: {}'.format(path))
-        return found
-
-    def hunt(self, directory_glob_path: Union[str, Iterable[str]], recurse_levels: int = 0) -> int:
-        """
-        scan a file or a directory for metadata, and update the metadatabase
-        Args:
-            directory_or_file_path:
-            recurse_levels:
-
-        Returns:
-            count (int): number of products found
-        """
-        S = self._DB.session()
-        if isinstance(directory_glob_path, str):
-            if os.path.isfile(directory_glob_path):
-                found = self.hunt_file(S, directory_glob_path)
-            elif os.path.isdir(directory_glob_path):
-                found = self.hunt_dir(S, directory_glob_path)
+    def _touch(self):
+        mtime = 0
+        if os.path.isfile(self._timestamp_path):
+            mtime = os.stat(self._timestamp_path).st_mtime
         else:
-            found = self.hunt_seq(S, directory_glob_path)
-        if found:
-            S.commit()
+            with open(self._timestamp_path, 'wb') as fp:
+                fp.close()
+        os.utime(self._timestamp_path)
+        return mtime
 
+    def __init__(self, ws: [Workspace, _workspace_test_proxy]):
+        super(ResourceSearchPathCollector, self).__init__()
+        self._ws = ws
+        self._paths = []
+        self._dir_mtimes = {}
+        self._scheduled_files = []
+        self._timestamp_path = os.path.join(ws.cwd, '.last_collection_check')
+        self._is_posix = sys.platform in {'linux', 'darwin'}
 
-class GoesRHunter(aHunter):
+    def look_for_new_files(self):
+        if len(self._scheduled_dirs):
+            new_dirs, self._scheduled_dirs = self._scheduled_dirs, []
+            LOG.debug('giving special attention to new search paths {}'.format(':'.join(new_dirs)))
+            new_files = list(self._skim(0, new_dirs))
+            LOG.debug('found {} files in new search paths'.format(len(new_files)))
+            self._scheduled_files += new_files
+        when = self._touch()
+        new_files = list(self._skim(when))
+        if new_files:
+            LOG.info('found {} additional files to skim metadata for, for a total of {}'.format(len(new_files), len(self._scheduled_files)))
+            self._scheduled_files += new_files
 
-    def get_metadata(self, dest_uuid, source_path=None, source_uri=None, cache_path=None, **kwargs):
+    def bgnd_look_for_new_files(self):
+        LOG.debug("searching for files in search path {}".format(':'.join(self._paths)))
+        yield {TASK_DOING: 'skimming', TASK_PROGRESS: 0.5}
+        self.look_for_new_files()
+        yield {TASK_DOING: 'skimming', TASK_PROGRESS: 1.0}
 
-        d = {}
-        # nc = nc4.Dataset(source_path)
-        pug = PugL1bTools(source_path)
-
-        d.update(self._metadata_for_abi_path(pug))
-        d[INFO.UUID] = dest_uuid
-        d[INFO.DATASET_NAME] = os.path.split(source_path)[-1]
-        d[INFO.PATHNAME] = source_path
-        d[INFO.KIND] = KIND.IMAGE
-
-        d[INFO.PROJ] = pug.proj4_string
-        # get nadir-meter-ish projection coordinate vectors to be used by proj4
-        y,x = pug.proj_y, pug.proj_x
-        d[INFO.ORIGIN_X] = x[0]
-        d[INFO.ORIGIN_Y] = y[0]
-
-        midyi, midxi = int(y.shape[0] / 2), int(x.shape[0] / 2)
-        # PUG states radiance at index [0,0] extends between coordinates [0,0] to [1,1] on a quadrille
-        # centers of pixels are therefore at +0.5, +0.5
-        # for a (e.g.) H x W image this means [H/2,W/2] coordinates are image center
-        # for now assume all scenes are even-dimensioned (e.g. 5424x5424)
-        # given that coordinates are evenly spaced in angular -> nadir-meters space,
-        # technically this should work with any two neighbor values
-        d[INFO.CELL_WIDTH] = x[midxi+1] - x[midxi]
-        d[INFO.CELL_HEIGHT] = y[midyi+1] - y[midyi]
-
-        shape = pug.shape
-        d[INFO.SHAPE] = shape
-        generate_guidebook_metadata(d)
-        LOG.debug(repr(d))
-        return d
-
-
-
-
-PATH_TEST_DATA = os.environ.get('TEST_DATA', os.path.expanduser("~/Data/test_files/thing.dat"))
-
-class tests(unittest.TestCase):
-    def setUp(self):
-        pass
-
-    def test_something(self):
-        pass
+    def bgnd_merge_new_file_metadata_into_mdb(self):
+        # FIXME: Don't depend on paths as the "how many products will we have"
+        todo, self._scheduled_files = self._scheduled_files, []
+        ntodo = len(todo)
+        LOG.debug('collecting metadata from {} potential new files'.format(ntodo))
+        redex = dict((name, dex) for (dex, name) in enumerate(todo))
+        yield {TASK_DOING: 'collecting metadata 0/{}'.format(ntodo), TASK_PROGRESS: 0.0}
+        changed_uuids = set()
+        for num_prods, product_info in self._ws.collect_product_metadata_for_paths(todo):
+            path = product_info.get(INFO.PATHNAME, None)
+            dex = redex.get(path, 0.0)
+            status = {TASK_DOING: 'collecting metadata {}/{}'.format(dex+1, ntodo), TASK_PROGRESS: float(dex)/float(ntodo)}
+            # LOG.debug(repr(status))
+            changed_uuids.add(product_info[INFO.UUID])
+            yield status
+        yield {TASK_DOING: 'collecting metadata done', TASK_PROGRESS: 1.0}
+        if changed_uuids:
+            LOG.debug('{} changed UUIDs, signaling product updates'.format(len(changed_uuids)))
+            # FUTURE: decide whether signals for metadatabase should belong to metadatabase
+            self._ws.didUpdateProductsMetadata.emit(changed_uuids)
 
 
 def _debug(type, value, tb):
@@ -165,7 +200,8 @@ def main():
     args = parser.parse_args()
 
     levels = [logging.ERROR, logging.WARN, logging.INFO, logging.DEBUG]
-    logging.basicConfig(level=levels[min(3, args.verbosity)])
+    logging.basicConfig(level=levels[min(3, args.verbosity)], datefmt='%Y-%m-%dT%H:%M:%S',
+                        format='%(levelname)s %(asctime)s %(module)s:%(funcName)s:L%(lineno)d %(message)s')
 
     if args.debug:
         sys.excepthook = _debug
@@ -174,8 +210,19 @@ def main():
         unittest.main()
         return 0
 
-    for pn in args.inputs:
-        pass
+    ws = _workspace_test_proxy()
+    collector = ResourceSearchPathCollector(ws)
+    collector.paths = list(args.inputs)
+
+    from time import sleep
+    for i in range(3):
+        if i > 0:
+            sleep(5)
+        LOG.info("poll #{}".format(i+1))
+        collector.look_for_new_files()
+        if collector.has_pending_files:
+            for progress in collector.bgnd_merge_new_file_metadata_into_mdb():
+                LOG.debug(repr(progress))
 
     return 0
 

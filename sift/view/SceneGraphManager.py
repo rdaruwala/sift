@@ -27,21 +27,20 @@ __author__ = 'davidh'
 from vispy import app
 from vispy import scene
 from vispy.util.keys import SHIFT
-from vispy.visuals.transforms import STTransform, MatrixTransform
+from vispy.visuals.transforms import STTransform, MatrixTransform, ChainTransform
 from vispy.visuals import MarkersVisual, marker_types, LineVisual
 from vispy.scene.visuals import Markers, Polygon, Compound, Line
 from vispy.geometry import Rect
 from sift.common import DEFAULT_ANIMATION_DELAY, INFO, KIND, TOOL, prez
-# from sift.control.layer_list import LayerStackListViewModel
-from sift.view.LayerRep import NEShapefileLines, TiledGeolocatedImage, RGBCompositeLayer
+from sift.view.LayerRep import (NEShapefileLines, TiledGeolocatedImage,
+                                RGBCompositeLayer, PrecomputedIsocurve)
 from sift.view.MapWidget import SIFTMainMapCanvas
 from sift.view.Cameras import PanZoomProbeCamera
-from sift.view.Colormap import ALL_COLORMAPS
-from sift.model.document import DocLayerStack
+from sift.model.document import DocLayerStack, DocBasicLayer
 from sift.queue import TASK_DOING, TASK_PROGRESS
 from sift.view.ProbeGraphs import DEFAULT_POINT_PROBE
 from sift.view.transform import PROJ4Transform
-from sift.util import get_data_dir
+from sift.util import get_package_data_dir
 
 from PyQt4.QtCore import QObject, pyqtSignal, Qt
 from PyQt4.QtGui import QCursor, QPixmap
@@ -53,7 +52,7 @@ import sys
 import logging
 
 LOG = logging.getLogger(__name__)
-DATA_DIR = get_data_dir()
+DATA_DIR = get_package_data_dir()
 DEFAULT_SHAPE_FILE = os.path.join(DATA_DIR, 'ne_50m_admin_0_countries', 'ne_50m_admin_0_countries.shp')
 DEFAULT_STATES_SHAPE_FILE = os.path.join(DATA_DIR, 'ne_50m_admin_1_states_provinces_lakes', 'ne_50m_admin_1_states_provinces_lakes.shp')
 DEFAULT_TEXTURE_SHAPE = (4, 16)
@@ -257,8 +256,11 @@ class LayerSet(object):
 
     def update_layers_z(self):
         for z_level, uuid in enumerate(self._layer_order):
-            # assume ChainTransform where the last transform is STTransform for Z level
-            self._layers[uuid].transform.transforms[-1].translate = (0, 0, 0-int(z_level))
+            transform = self._layers[uuid].transform
+            if isinstance(transform, ChainTransform):
+                # assume ChainTransform where the last transform is STTransform for Z level
+                transform = transform.transforms[-1]
+            transform.translate = (0, 0, 0-int(z_level))
             self._layers[uuid].order = len(self._layer_order) - int(z_level)
         # Need to tell the scene to recalculate the drawing order (HACK, but it works)
         # FIXME: This should probably be accomplished by overriding the right method from the Node or Visual class
@@ -345,6 +347,84 @@ class LayerSet(object):
             self._frame_change_cb((self._frame_number, lfo, self._animating, uuid))
 
 
+class ContourGroupNode(scene.Node):
+    """VisPy scene graph node managing multiple visuals.
+
+    This Node handles view changes and representing different "zoom" levels
+    in the data that is provided to its child widgets.
+
+    """
+
+    @staticmethod
+    def visible_first(children):
+        invisible_children = []
+        for c in children:
+            if c.visible:
+                yield c
+            else:
+                invisible_children.append(c)
+        for c in invisible_children:
+            yield c
+
+    def on_view_change(self):
+        zoom_level = None
+        for child in self.visible_first(self.children):
+            if isinstance(child, PrecomputedIsocurve):
+                if zoom_level is None:
+                    zoom_level = self._assess_contour(child)
+                # child handles an unchanged zoom_level
+                child.zoom_level = zoom_level
+            else:
+                raise NotImplementedError("Don't know how to assess "
+                                          "non-contour layer")
+
+    def _assess_contour(self, child):
+        """Calculate shown portion of image and image units per pixel
+
+        This method utilizes a precomputed "mesh" of relatively evenly
+        spaced points over the entire image space. This mesh is transformed
+        to the canvas space (-1 to 1 user-viewed space) to figure out which
+        portions of the image are currently being viewed and which portions
+        can actually be projected on the viewed projection.
+
+        While the result of the chosen method may not always be completely
+        accurate, it should work for all possible viewing cases.
+        """
+        # in contour coordinate space, the extents of the canvas
+        canvas_extents = child.transforms.get_transform().imap([
+            [-1., -1.],
+            [0., 0.],
+            [1., 1.],
+            [-1., 1.],
+            [1., -1.]
+        ])[:, :2]
+        canvas_size = self.canvas.size
+        # valid projection coordinates
+        canvas_extents = canvas_extents[(canvas_extents[:, 0] <= 1e30) & (canvas_extents[:, 1] <= 1e30), :]
+        if not canvas_extents.size:
+            LOG.warning("Can't determine current view box, using lowest contour resolution")
+            zoom_level = 0
+        else:
+            min_x = canvas_extents[:, 0].min()
+            max_x = canvas_extents[:, 0].max()
+            min_y = canvas_extents[:, 1].min()
+            max_y = canvas_extents[:, 1].max()
+            pixel_ratio = max((max_x - min_x) / canvas_size[0], (max_y - min_y) / canvas_size[1])
+
+            if pixel_ratio > 10000:
+                zoom_level = 0
+            elif pixel_ratio > 5000:
+                zoom_level = 1
+            elif pixel_ratio > 3000:
+                zoom_level = 2
+            elif pixel_ratio > 1000:
+                zoom_level = 3
+            else:
+                zoom_level = 4
+
+        return zoom_level
+
+
 class SceneGraphManager(QObject):
     """
     SceneGraphManager represents a document as a vispy scenegraph.
@@ -399,8 +479,6 @@ class SceneGraphManager(QObject):
 
         self.image_elements = {}
         self.composite_element_dependencies = {}
-        self.colormaps = {}
-        self.colormaps.update(ALL_COLORMAPS)
         self.layer_set = LayerSet(self, frame_change_cb=self.frame_changed)
         self._current_tool = None
 
@@ -464,7 +542,7 @@ class SceneGraphManager(QObject):
         self.main_view = self.main_canvas.central_widget.add_view()
 
         # Camera Setup
-        self.pz_camera = PanZoomProbeCamera(name=TOOL.PAN_ZOOM, aspect=1, pan_limits=(-1., -1., 1., 1.), zoom_limits=(0.0015, 0.0015))
+        self.pz_camera = PanZoomProbeCamera(name=TOOL.PAN_ZOOM.name, aspect=1, pan_limits=(-1., -1., 1., 1.), zoom_limits=(0.0015, 0.0015))
         self.main_view.camera = self.pz_camera
         self.main_view.camera.flip = (False, False, False)
         # self.main_view.events.mouse_press.connect(self.on_mouse_press_point, after=list(self.main_view.events.mouse_press.callbacks))
@@ -486,6 +564,7 @@ class SceneGraphManager(QObject):
         proj_info = self.document.projection_info()
         self.main_map = MainMap(name="MainMap", parent=self.main_map_parent)
         self.main_map.transform = PROJ4Transform(proj_info['proj4_str'])
+        self.proxy_nodes = {}
 
         self._borders_color_idx = 0
         self.borders = NEShapefileLines(self.border_shapefile, double=True, color=self._color_choices[self._borders_color_idx], parent=self.main_map)
@@ -497,6 +576,8 @@ class SceneGraphManager(QObject):
         self.latlon_grid = self._init_latlon_grid_layer(color=self._color_choices[self._latlon_grid_color_idx])
         self.latlon_grid.transform = STTransform(translate=(0, 0, 45))
 
+        self.create_test_image()
+
         # Make the camera center on Guam
         # center = (144.8, 13.5)
         center = center or proj_info["default_center"]
@@ -505,6 +586,42 @@ class SceneGraphManager(QObject):
         ll_xy = self.borders.transforms.get_transform(map_to="scene").map([(center[0] - width, center[1] - height)])[0][:2]
         ur_xy = self.borders.transforms.get_transform(map_to="scene").map([(center[0] + width, center[1] + height)])[0][:2]
         self.main_view.camera.rect = Rect(ll_xy, (ur_xy[0] - ll_xy[0], ur_xy[1] - ll_xy[1]))
+
+    def create_test_image(self):
+        proj4_str = os.getenv("SIFT_DEBUG_IMAGE_PROJ", None)
+        if proj4_str is None:
+            return
+        shape = (2000, 2000)
+        fake_data = np.zeros(shape, np.float32) + 0.5
+        fake_data[:5, :] = 1.
+        fake_data[-5:, :] = 1.
+        fake_data[:, :5] = 1.
+        fake_data[:, -5:] = 1.
+        cell_size = 1000
+        origin_x = -shape[1] / 2. * cell_size
+        origin_y = shape[0] / 2. * cell_size
+
+        image = TiledGeolocatedImage(
+            fake_data,
+            origin_x,
+            origin_y,
+            cell_size,
+            cell_size,
+            name="Test Image",
+            clim=(0., 1.),
+            gamma=1.,
+            interpolation='nearest',
+            method='tiled',
+            cmap=self.document.find_colormap('grays'),
+            double=False,
+            texture_shape=DEFAULT_TEXTURE_SHAPE,
+            wrap_lon=False,
+            parent=self.main_map,
+            projection=proj4_str,
+        )
+        image.transform = PROJ4Transform(proj4_str, inverse=True)
+        image.transform *= STTransform(translate=(0, 0, -50.0))
+        self._test_img = image
 
     def set_projection(self, projection_name, proj_info, center=None):
         self.main_map.transform = PROJ4Transform(proj_info['proj4_str'])
@@ -515,7 +632,8 @@ class SceneGraphManager(QObject):
         ur_xy = self.borders.transforms.get_transform(map_to="scene").map([(center[0] + width, center[1] + height)])[0][:2]
         self.main_view.camera.rect = Rect(ll_xy, (ur_xy[0] - ll_xy[0], ur_xy[1] - ll_xy[1]))
         for img in self.image_elements.values():
-            img.determine_reference_points()
+            if hasattr(img, 'determine_reference_points'):
+                img.determine_reference_points()
         self.on_view_change(None)
 
     def _init_latlon_grid_layer(self, color=None, resolution=5.):
@@ -721,13 +839,8 @@ class SceneGraphManager(QObject):
         idx = (idx + 1) % len(tool_names)
         self.change_tool(tool_names[idx])
 
-    def _find_colormap(self, colormap):
-        if isinstance(colormap, str) and colormap in self.colormaps:
-            colormap = self.colormaps[colormap]
-        return colormap
-
     def set_colormap(self, colormap, uuid=None):
-        colormap = self._find_colormap(colormap)
+        colormap = self.document.find_colormap(colormap)
 
         uuids = uuid
         if uuid is None:
@@ -736,10 +849,11 @@ class SceneGraphManager(QObject):
             uuids = [uuid]
 
         for uuid in uuids:
-            self.image_elements[uuid].cmap = colormap
-
-    def add_colormap(self, name:str, colormap):
-        self.colormaps[name] = colormap
+            layer = self.image_elements[uuid]
+            if isinstance(layer, TiledGeolocatedImage):
+                self.image_elements[uuid].cmap = colormap
+            else:
+                self.image_elements[uuid].color = colormap
 
     def set_color_limits(self, clims, uuid=None):
         """Update the color limits for the specified UUID
@@ -764,11 +878,11 @@ class SceneGraphManager(QObject):
 
         for uuid in uuids:
             element = self.image_elements.get(uuid, None)
-            if element is not None:
+            if element is not None and hasattr(element, 'gamma'):
                 self.image_elements[uuid].gamma = gamma
 
     def change_layers_colormap(self, change_dict):
-        for uuid,cmapid in change_dict.items():
+        for uuid, cmapid in change_dict.items():
             LOG.info('changing {} to colormap {}'.format(uuid, cmapid))
             self.set_colormap(cmapid, uuid)
 
@@ -782,13 +896,59 @@ class SceneGraphManager(QObject):
             LOG.info('changing {} to gamma {}'.format(uuid, gamma))
             self.set_gamma(gamma, uuid)
 
+    def change_layers_image_kind(self, change_dict):
+        for uuid, new_pz in change_dict.items():
+            LOG.info('changing {} to kind {}'.format(uuid, new_pz.kind.name))
+            self.add_basic_layer(None, uuid, new_pz)
+
+    def add_contour_layer(self, layer:DocBasicLayer, p:prez, overview_content:np.ndarray):
+        verts = overview_content[:, :2]
+        connects = overview_content[:, 2].astype(np.bool)
+        level_indexes = overview_content[:, 3]
+        level_indexes = level_indexes[~np.isnan(level_indexes)].astype(np.int)
+        levels = layer["contour_levels"]
+        cmap = self.document.find_colormap(p.colormap)
+
+        proj4_str = layer[INFO.PROJ]
+        parent = self.proxy_nodes.get(proj4_str)
+        if parent is None:
+            parent = ContourGroupNode(parent=self.main_map)
+            parent.transform = PROJ4Transform(layer[INFO.PROJ], inverse=True)
+            self.proxy_nodes[proj4_str] = parent
+
+        contour_visual = PrecomputedIsocurve(verts, connects, level_indexes,
+                                             levels=levels, color_lev=cmap,
+                                             clim=p.climits,
+                                             parent=parent,
+                                             name=str(layer[INFO.UUID]))
+        contour_visual.transform *= STTransform(translate=(0, 0, -50.0))
+        self.image_elements[layer[INFO.UUID]] = contour_visual
+        self.layer_set.add_layer(contour_visual)
+        self.on_view_change(None)
+
     def add_basic_layer(self, new_order:tuple, uuid:UUID, p:prez):
         layer = self.document[uuid]
         # create a new layer in the imagelist
         if not layer.is_valid:
             LOG.warning('unable to add an invalid layer, will try again later when layer changes')
             return
-        overview_content = self.workspace.get_content(layer.uuid)
+        if layer[INFO.UUID] in self.image_elements:
+            image = self.image_elements[layer[INFO.UUID]]
+            if p.kind == KIND.CONTOUR and isinstance(image, PrecomputedIsocurve):
+                LOG.warning("Contour layer already exists in scene")
+                return
+            if p.kind == KIND.IMAGE and isinstance(image, TiledGeolocatedImage):
+                LOG.warning("Image layer already exists in scene")
+                return
+            # we already have an image layer for it and it isn't what we want
+            # remove the existing image object and create the proper type now
+            image.parent = None
+            del self.image_elements[layer[INFO.UUID]]
+
+        overview_content = self.workspace.get_content(layer.uuid, kind=p.kind)
+        if p.kind == KIND.CONTOUR:
+            return self.add_contour_layer(layer, p, overview_content)
+
         image = TiledGeolocatedImage(
             overview_content,
             layer[INFO.ORIGIN_X],
@@ -800,7 +960,7 @@ class SceneGraphManager(QObject):
             gamma=p.gamma,
             interpolation='nearest',
             method='tiled',
-            cmap=self._find_colormap(p.colormap),
+            cmap=self.document.find_colormap(p.colormap),
             double=False,
             texture_shape=DEFAULT_TEXTURE_SHAPE,
             wrap_lon=False,
@@ -820,9 +980,9 @@ class SceneGraphManager(QObject):
         if not layer.is_valid:
             LOG.info('unable to add an invalid layer, will try again later when layer changes')
             return
-        if layer[INFO.KIND] == KIND.RGB:
+        if p.kind == KIND.RGB:
             dep_uuids = r,g,b = [c.uuid if c is not None else None for c in [layer.r, layer.g, layer.b]]
-            overview_content = list(self.workspace.get_content(cuuid) for cuuid in dep_uuids)
+            overview_content = list(self.workspace.get_content(cuuid, kind=KIND.IMAGE) for cuuid in dep_uuids)
             uuid = layer.uuid
             LOG.debug("Adding composite layer to Scene Graph Manager with UUID: %s", uuid)
             self.image_elements[uuid] = element = RGBCompositeLayer(
@@ -832,11 +992,11 @@ class SceneGraphManager(QObject):
                 layer[INFO.CELL_WIDTH],
                 layer[INFO.CELL_HEIGHT],
                 name=str(uuid),
-                clim=layer[INFO.CLIM],
+                clim=p.climits,
                 gamma=p.gamma,
                 interpolation='nearest',
                 method='tiled',
-                cmap=self._find_colormap("grays"),
+                cmap=None,
                 double=False,
                 texture_shape=DEFAULT_TEXTURE_SHAPE,
                 wrap_lon=False,
@@ -853,13 +1013,20 @@ class SceneGraphManager(QObject):
             element.determine_reference_points()
             self.update()
             return True
-        elif layer[INFO.KIND] == KIND.COMPOSITE:
+        elif p.kind in [KIND.COMPOSITE, KIND.IMAGE]:
             # algebraic layer
             return self.add_basic_layer(new_order, uuid, p)
 
-    def change_composite_layer(self, new_order:tuple, uuid:UUID, presentation:prez, changes:dict):
+    def change_composite_layers(self, new_order:tuple, uuid_list:list, presentations:list):
+        for uuid, presentation in zip(uuid_list, presentations):
+            self.change_composite_layer(None, uuid, presentation)
+        # set the order after we've updated and created all the new layers
+        if new_order:
+            self.layer_set.set_layer_order(new_order)
+
+    def change_composite_layer(self, new_order:tuple, uuid:UUID, presentation:prez):
         layer = self.document[uuid]
-        if layer[INFO.KIND] == KIND.RGB:
+        if presentation.kind == KIND.RGB:
             if layer.uuid in self.image_elements:
                 if layer.is_valid:
                     # RGB selection has changed, rebuild the layer
@@ -874,7 +1041,8 @@ class SceneGraphManager(QObject):
                                       origin_x=layer[INFO.ORIGIN_X],
                                       origin_y=layer[INFO.ORIGIN_Y])
                     elem.init_overview(overview_content)
-                    elem.clim = layer[INFO.CLIM]
+                    elem.clim = presentation.climits
+                    elem.gamma = presentation.gamma
                     self.on_view_change(None)
                     elem.determine_reference_points()
                 else:
@@ -950,8 +1118,10 @@ class SceneGraphManager(QObject):
         document.didChangeLayerVisibility.connect(self.change_layers_visibility)
         document.didReorderAnimation.connect(self._rebuild_frame_order)
         document.didChangeComposition.connect(self.change_composite_layer)
+        document.didChangeCompositions.connect(self.change_composite_layers)
         document.didChangeColorLimits.connect(self.change_layers_color_limits)
         document.didChangeGamma.connect(self.change_layers_gamma)
+        document.didChangeImageKind.connect(self.change_layers_image_kind)
 
     def set_frame_number(self, frame_number=None):
         self.layer_set.next_frame(None, frame_number)
@@ -1060,11 +1230,15 @@ class SceneGraphManager(QObject):
 
         def _assess_if_active(uuid):
             element = self.image_elements.get(uuid, None)
-            if element is not None:
+            if element is not None and hasattr(element, 'assess'):
                 _assess(uuid, element)
 
         for uuid in current_visible_layers:
             _assess_if_active(uuid)
+        # update contours
+        for node in self.proxy_nodes.values():
+            node.on_view_change()
+        # update invisible layers
         for uuid in current_invisible_layers:
             _assess_if_active(uuid)
 

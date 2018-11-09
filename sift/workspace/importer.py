@@ -17,7 +17,7 @@ import re
 from abc import ABC, abstractmethod, abstractclassmethod
 from collections import namedtuple
 from datetime import datetime, timedelta
-from typing import Sequence, Iterable, Generator, Mapping
+from typing import Sequence, Iterable, Generator, Mapping, Tuple
 import gdal
 import osr
 import asyncio
@@ -25,14 +25,28 @@ import numpy as np
 from pyproj import Proj
 from sqlalchemy.orm import Session
 
-from sift.common import PLATFORM, INFO, INSTRUMENT, KIND
+from sift.common import PLATFORM, INFO, INSTRUMENT, KIND, INSTRUMENT_MAP, PLATFORM_MAP
 from sift.workspace.goesr_pug import PugFile
 from sift.workspace.guidebook import ABI_AHI_Guidebook, Guidebook
 from .metadatabase import Resource, Product, Content
 
 LOG = logging.getLogger(__name__)
 
+try:
+    from satpy import Scene
+    from satpy.dataset import DatasetID
+except ImportError:
+    LOG.warning("SatPy is not installed and will not be used for importing.")
+    Scene = None
+    DatasetID = None
+
+try:
+    from skimage.measure import find_contours
+except ImportError:
+    find_contours = None
+
 DEFAULT_GTIFF_OBS_DURATION = timedelta(seconds=60)
+DEFAULT_GUIDEBOOK = ABI_AHI_Guidebook
 
 GUIDEBOOKS = {
     PLATFORM.GOES_16: ABI_AHI_Guidebook,
@@ -50,7 +64,81 @@ import_progress = namedtuple('import_progress', ['uuid', 'stages', 'current_stag
 
 def get_guidebook_class(layer_info) -> Guidebook:
     platform = layer_info.get(INFO.PLATFORM)
-    return GUIDEBOOKS[platform]()
+    return GUIDEBOOKS.get(platform, DEFAULT_GUIDEBOOK)()
+
+
+def get_contour_increments(layer_info):
+    standard_name = layer_info[INFO.STANDARD_NAME]
+    units = layer_info[INFO.UNITS]
+    increments = {
+        'air_temperature': [5., 2.5, 1., 0.5, 0.1],
+        'relative_humidity': [15., 10., 5., 2., 1.],
+        'eastward_wind': [15., 10., 5., 2., 1.],
+        'northward_wind': [15., 10., 5., 2., 1.],
+        'geopotential_height': [100., 50., 25., 10., 5.],
+    }
+
+    unit_increments = {
+        'K': [5., 2.5, 1., 0.5, 0.1],
+        '%': [15., 10., 5., 2., 1.],
+        'kg m**-2': [20., 10., 5., 2., 1.],
+        'm s**-1': [15., 10., 5., 2., 1.],
+        'm**2 s**-1': [5000., 1000., 500., 200., 100.],
+        'gpm': [6000., 2000., 1000., 500., 200.],
+        'kg kg**-1': [16e-8, 8e-8, 4e-8, 2e-8, 1e-8],
+        'Pa s**-1': [6., 3., 2., 1., 0.5],
+        's**-1': [0.02, 0.01, 0.005, 0.002, 0.001],
+        'Pa': [5000., 1000., 500., 200., 100.],
+        'J kg**-1': [5000., 1000., 500., 200., 100.],
+        '(0 - 1)': [0.5, 0.2, 0.1, 0.05, 0.05],
+    }
+
+    contour_increments = increments.get(standard_name)
+    if contour_increments is None:
+        contour_increments = unit_increments.get(units)
+
+        # def _in_group(wg, grp):
+        #     return round(wg / grp) * grp >= grp
+        # contour_increments = [5., 2.5, 1., 0.5, 0.1]
+        # vmin, vmax = layer_info[INFO.VALID_RANGE]
+        # width_guess = vmax - vmin
+        # if _in_group(width_guess, 10000.):
+        #     contour_increments = [x * 100. for x in contour_increments]
+        # elif _in_group(width_guess, 1000.):
+        #     contour_increments = [x * 50. for x in contour_increments]
+        # elif _in_group(width_guess, 100.):
+        #     contour_increments = [x * 10. for x in contour_increments]
+        # elif _in_group(width_guess, 10.):
+        #     contour_increments = [x * 1. for x in contour_increments]
+    if contour_increments is None:
+        LOG.warning("Unknown contour data type ({}, {}), guessing at contour "
+                    "levels...".format(standard_name, units))
+        return [5000., 1000., 500., 200., 100.]
+
+    LOG.debug("Contour increments for ({}, {}): {}".format(
+        standard_name, units, contour_increments))
+    return contour_increments
+
+
+def get_contour_levels(vmin, vmax, increments):
+    levels = []
+    mult = 1 / increments[-1]
+    for idx, inc in enumerate(increments):
+        vmin_round = np.ceil(vmin / inc) * inc
+        vmax_round = np.ceil(vmax / inc) * inc
+        inc_levels = np.arange(vmin_round, vmax_round, inc)
+        # round to the highest increment or modulo operations will be wrong
+        inc_levels = np.round(inc_levels / increments[-1]) * increments[-1]
+        if idx > 0:
+            # don't use coarse contours in the finer contour levels
+            # we multiple by 1 / increments[-1] to try to resolve precision
+            # errors which can be a big issue for very small increments.
+            mask = np.logical_or.reduce([
+                np.isclose((inc_levels * mult) % (i * mult), 0) for i in increments[:idx]])
+            inc_levels = inc_levels[~mask]
+        levels.append(inc_levels)
+
+    return levels
 
 
 def generate_guidebook_metadata(layer_info) -> Mapping:
@@ -68,7 +156,15 @@ def generate_guidebook_metadata(layer_info) -> Mapping:
     if INFO.DISPLAY_NAME not in layer_info:
         layer_info[INFO.DISPLAY_NAME] = guidebook._default_display_name(layer_info)
 
+    if 'level' in layer_info:
+        # calculate contour_levels and zoom levels
+        increments = get_contour_increments(layer_info)
+        vmin, vmax = layer_info[INFO.VALID_RANGE]
+        contour_levels = get_contour_levels(vmin, vmax, increments)
+        layer_info['contour_levels'] = contour_levels
+
     return layer_info
+
 
 class aImporter(ABC):
     """
@@ -91,9 +187,10 @@ class aImporter(ABC):
         except IndexError:
             LOG.error('no resources in {} {}'.format(repr(type(prod)), repr(prod)))
             raise
-        return cls(prod.resource[0].path, workspace_cwd=workspace_cwd, database_session=database_session)
+        return cls(prod.resource[0].path, workspace_cwd=workspace_cwd, database_session=database_session, **kwargs)
 
-    @abstractclassmethod
+    @classmethod
+    @abstractmethod
     def is_relevant(cls, source_path=None, source_uri=None) -> bool:
         """
         return True if this importer is capable of reading this URI.
@@ -133,7 +230,6 @@ class aImporter(ABC):
         return
 
 
-
 class aSingleFileWithSingleProductImporter(aImporter):
     """
     simplification of importer that handles a single-file with a single product
@@ -144,6 +240,10 @@ class aSingleFileWithSingleProductImporter(aImporter):
     def __init__(self, source_path, workspace_cwd, database_session, **kwargs):
         super(aSingleFileWithSingleProductImporter, self).__init__(workspace_cwd, database_session)
         self.source_path = source_path
+
+    @property
+    def num_products(self):
+        return 1
 
     def merge_resources(self) -> Iterable[Resource]:
         """
@@ -192,7 +292,7 @@ class aSingleFileWithSingleProductImporter(aImporter):
 
         if len(res.product):
             zult = list(res.product)
-            LOG.debug('pre-existing products {}'.format(repr(zult)))
+            # LOG.debug('pre-existing products {}'.format(repr(zult)))
             return zult
 
         # else probe the file and add product metadata, without importing content
@@ -215,7 +315,6 @@ class aSingleFileWithSingleProductImporter(aImporter):
         self._S.add(prod)
         self._S.commit()
         return [prod]
-
 
 
 class GeoTiffImporter(aSingleFileWithSingleProductImporter):
@@ -387,7 +486,7 @@ class GeoTiffImporter(aSingleFileWithSingleProductImporter):
         shape = rows, cols = band.YSize, band.XSize
         blockw, blockh = band.GetBlockSize()  # non-blocked files will report [band.XSize,1]
 
-        data_filename = '{}.data'.format(prod.uuid)
+        data_filename = '{}.image'.format(prod.uuid)
         data_path = os.path.join(self._cwd, data_filename)
 
         coverage_filename = '{}.coverage'.format(prod.uuid)
@@ -504,13 +603,14 @@ class GoesRPUGImporter(aSingleFileWithSingleProductImporter):
         return {
             INFO.PLATFORM: PLATFORM_ID_TO_PLATFORM[pug.platform_id],  # e.g. G16, H8
             INFO.BAND: pug.band,
+            INFO.DATASET_NAME: 'B{:02d}'.format(pug.band),
             INFO.INSTRUMENT: INSTRUMENT.AHI if 'Himawari' in pug.instrument_type else INSTRUMENT.ABI,
             INFO.SCHED_TIME: pug.sched_time,
             INFO.OBS_TIME: pug.time_span[0],
             INFO.OBS_DURATION: pug.time_span[1] - pug.time_span[0],
             INFO.DISPLAY_TIME: pug.display_time,
             INFO.SCENE: pug.scene_id,
-            INFO.DISPLAY_NAME: pug.display_name
+            INFO.DISPLAY_NAME: pug.display_name,
         }
 
     @classmethod
@@ -547,7 +647,7 @@ class GoesRPUGImporter(aSingleFileWithSingleProductImporter):
         pug = pug or GoesRPUGImporter.pug_factory(source_path)
 
         d.update(GoesRPUGImporter._basic_pug_metadata(pug))
-        d[INFO.DATASET_NAME] = os.path.split(source_path)[-1]
+        # d[INFO.DATASET_NAME] = os.path.split(source_path)[-1]
         d[INFO.PATHNAME] = source_path
         d[INFO.KIND] = KIND.IMAGE
 
@@ -573,6 +673,10 @@ class GoesRPUGImporter(aSingleFileWithSingleProductImporter):
         shape = pug.shape
         d[INFO.SHAPE] = shape
         generate_guidebook_metadata(d)
+
+        d[INFO.FAMILY] = '{}:{}:{}:{:5.2f}µm'.format(KIND.IMAGE.name, 'geo', d[INFO.STANDARD_NAME], d[INFO.CENTRAL_WAVELENGTH]) # kind:pointofreference:measurement:wavelength
+        d[INFO.CATEGORY] = 'NOAA-PUG:{}:{}:{}'.format(d[INFO.PLATFORM].name, d[INFO.INSTRUMENT].name, d[INFO.SCENE])  # system:platform:instrument:target
+        d[INFO.SERIAL] = d[INFO.SCHED_TIME].strftime("%Y%m%dT%H%M%S")
         LOG.debug(repr(d))
         return d
 
@@ -610,7 +714,7 @@ class GoesRPUGImporter(aSingleFileWithSingleProductImporter):
 
         now = datetime.utcnow()
 
-        data_filename = '{}.data'.format(prod.uuid)
+        data_filename = '{}.image'.format(prod.uuid)
         data_path = os.path.join(self._cwd, data_filename)
 
         # coverage_filename = '{}.coverage'.format(prod.uuid)
@@ -686,6 +790,454 @@ class GoesRPUGImporter(aSingleFileWithSingleProductImporter):
                               stage_desc="GOES PUG data add to workspace",
                               dataset_info=None,
                               data=img_data)
+
+
+class SatPyImporter(aImporter):
+    """Generic SatPy importer"""
+
+    def __init__(self, source_path, workspace_cwd, database_session, **kwargs):
+        super(SatPyImporter, self).__init__(workspace_cwd, database_session)
+        reader = kwargs.pop('reader', None)
+        if reader is None:
+            raise NotImplementedError("Can't automatically determine reader.")
+        if not isinstance(source_path, (list, tuple)):
+            source_path = [source_path]
+
+        if len(source_path) > 1:
+            raise NotImplementedError("SatPy importer does not currently "
+                                      "support reading more than one file "
+                                      "at a time.")
+        if Scene is None:
+            raise ImportError("SatPy is not available and can't be used as "
+                              "an importer")
+        self.filenames = list(source_path)
+        self.reader = reader
+        if 'scene' in kwargs:
+            self.scn = kwargs['scene']
+        else:
+            self.scn = Scene(reader=self.reader,
+                               filenames=self.filenames)
+        self._resources = []
+        # DatasetID filters
+        self.product_filters = {}
+        for k in ['resolution', 'calibration', 'level']:
+            if k in kwargs:
+                self.product_filters[k] = kwargs.pop(k)
+        # NOTE: product_filters don't do anything if the dataset_ids aren't
+        #       specified since we are using all available dataset ids
+        self.dataset_ids = sorted(kwargs.get('dataset_ids', self.scn.available_dataset_ids()))
+
+    @classmethod
+    def from_product(cls, prod: Product, workspace_cwd, database_session, **kwargs):
+        # this overrides the base class because we assume that the product
+        # has kwargs that we want
+        # NOTE: The kwargs are currently provided by the caller in
+        # workspace.py so this isn't needed right now
+        # FIXME: deal with products that need more than one resource
+        try:
+            cls = prod.resource[0].format
+        except IndexError:
+            LOG.error('no resources in {} {}'.format(repr(type(prod)), repr(prod)))
+            raise
+        kwargs.pop('reader', None)
+        kwargs.pop('scenes', None)
+        kwargs.pop('scene', None)
+        kwargs['dataset_ids'] = [DatasetID.from_dict(prod.info)]
+        return cls(prod.resource[0].path, workspace_cwd=workspace_cwd, database_session=database_session, **kwargs)
+
+    @classmethod
+    def is_relevant(cls, source_path=None, source_uri=None):
+        # this importer should only be used if specifically requested
+        return False
+
+    def merge_resources(self):
+        if len(self._resources) == len(self.filenames):
+            return self._resources
+
+        resources = self._S.query(Resource).filter(
+            Resource.path.in_(self.filenames)).all()
+        if len(resources) == len(self.filenames):
+            self._resources = resources
+            return self._resources
+
+        now = datetime.utcnow()
+        res_dict = {r.path: r for r in self._resources}
+        for fn in self.filenames:
+            if fn in res_dict:
+                continue
+
+            res = Resource(
+                format=type(self),
+                path=fn,
+                mtime=now,
+                atime=now,
+            )
+            self._S.add(res)
+            res_dict[fn] = res
+
+        self._resources = res_dict.values()
+        return self._resources
+
+    def merge_products(self):
+        resources = self.merge_resources()
+        if resources is None:
+            LOG.debug('no resources for {}'.format(self.filenames))
+            return
+
+        # FIXME: This doesn't work for multiple files to one product
+        resources = list(resources)
+        if len(resources) > 1:
+            raise NotImplementedError("Products created from more than one "
+                                      "file are not currently supported.")
+        res = resources[0]
+        products = list(res.product)
+        existing_ids = {DatasetID.from_dict(prod.info): prod for prod in products}
+        existing_prods = {x: existing_ids[x] for x in self.dataset_ids if x in existing_ids}
+        if products and len(existing_prods) == len(self.dataset_ids):
+            products = existing_prods.values()
+            LOG.debug('pre-existing products {}'.format(repr(products)))
+            yield from products
+            return
+
+        from uuid import uuid1
+        scn = self.load_all_datasets()
+        for ds_id, ds in scn.datasets.items():
+            # don't recreate a Product for one we already have
+            if ds_id in existing_ids:
+                yield existing_ids[ds_id]
+                continue
+
+            existing_ids.get(ds_id, None)
+            meta = ds.attrs
+            uuid = uuid1()
+            meta[INFO.UUID] = uuid
+            now = datetime.utcnow()
+            prod = Product(
+                uuid_str=str(uuid),
+                atime=now,
+            )
+            prod.resource.append(res)
+
+            assert(INFO.OBS_TIME in meta)
+            assert(INFO.OBS_DURATION in meta)
+            prod.update(meta)  # sets fields like obs_duration and obs_time transparently
+            assert(prod.info[INFO.OBS_TIME] is not None and prod.obs_time is not None)
+            assert(prod.info[INFO.VALID_RANGE] is not None)
+            LOG.debug('new product: {}'.format(repr(prod)))
+            self._S.add(prod)
+            self._S.commit()
+            yield prod
+
+    @property
+    def num_products(self) -> int:
+        # WARNING: This could provide radiances and higher level products
+        #          which SIFT probably shouldn't care about
+        return len(self.dataset_ids)
+
+    @staticmethod
+    def _get_platform_instrument(attrs: dict):
+        """Convert SatPy platform_name/sensor to """
+        attrs[INFO.INSTRUMENT] = attrs.get('sensor')
+        attrs[INFO.PLATFORM] = attrs.get('platform_name')
+
+        # Special handling of GRIB forecast data
+        if 'centreDescription' in attrs and \
+                attrs[INFO.INSTRUMENT] == 'unknown':
+            description = attrs['centreDescription']
+            if attrs.get(INFO.PLATFORM) is None:
+                attrs[INFO.PLATFORM] = 'NWP'
+            if 'NCEP' in description:
+                attrs[INFO.INSTRUMENT] = 'GFS'
+        if attrs[INFO.INSTRUMENT] in ['GFS', 'unknown']:
+            attrs[INFO.INSTRUMENT] = INSTRUMENT.GFS
+        if attrs[INFO.PLATFORM] in ['NWP', 'unknown']:
+            attrs[INFO.PLATFORM] = PLATFORM.NWP
+
+        # FUTURE: Use standard string names for platform/instrument
+        #         instead of an Enum. Otherwise, could use a reverse
+        #         Enum lookup to match Enum values to Enum keys.
+        # if we haven't figured out what these are then give up and say they are unknown
+        if isinstance(attrs[INFO.PLATFORM], str):
+            plat_str = attrs[INFO.PLATFORM].lower().replace('-', '')
+            attrs[INFO.PLATFORM] = PLATFORM_MAP.get(plat_str, attrs[INFO.PLATFORM])
+        if not attrs[INFO.PLATFORM] or isinstance(attrs[INFO.PLATFORM], str):
+            attrs[INFO.PLATFORM] = PLATFORM.UNKNOWN
+
+        if isinstance(attrs[INFO.INSTRUMENT], str):
+            inst_str = attrs[INFO.INSTRUMENT].lower().replace('-', '')
+            attrs[INFO.INSTRUMENT] = INSTRUMENT_MAP.get(inst_str, attrs[INFO.INSTRUMENT])
+        if not attrs[INFO.INSTRUMENT] or isinstance(attrs[INFO.INSTRUMENT], str):
+            attrs[INFO.INSTRUMENT] = INSTRUMENT.UNKNOWN
+
+    def load_all_datasets(self) -> Scene:
+        self.scn.load(self.dataset_ids, **self.product_filters)
+        # copy satpy metadata keys to SIFT keys
+        for ds in self.scn:
+            start_time = ds.attrs['start_time']
+            ds.attrs[INFO.OBS_TIME] = start_time
+            ds.attrs[INFO.SCHED_TIME] = start_time
+            duration = start_time - ds.attrs.get('end_time', start_time)
+            if duration.total_seconds() == 0:
+                duration = timedelta(minutes=60)
+            ds.attrs[INFO.OBS_DURATION] = duration
+
+            # Handle GRIB platform/instrument
+            ds.attrs[INFO.KIND] = KIND.IMAGE if self.reader != 'grib' else \
+                KIND.CONTOUR
+            self._get_platform_instrument(ds.attrs)
+            ds.attrs.setdefault(INFO.STANDARD_NAME, ds.attrs.get('standard_name'))
+            if 'wavelength' in ds.attrs:
+                ds.attrs.setdefault(INFO.CENTRAL_WAVELENGTH,
+                                    ds.attrs['wavelength'][0])
+
+            # Resolve anything else needed by SIFT
+            id_str = ":".join(str(v) for v in DatasetID.from_dict(ds.attrs))
+            ds.attrs[INFO.DATASET_NAME] = id_str
+            model_time = ds.attrs.get('model_time')
+            if model_time is not None:
+                ds.attrs[INFO.DATASET_NAME] += " " + model_time.isoformat()
+            ds.attrs[INFO.BAND] = 0
+            ds.attrs[INFO.SHORT_NAME] = ds.attrs['name']
+            if ds.attrs.get('level') is not None:
+                ds.attrs[INFO.SHORT_NAME] = "{} @ {}hPa".format(
+                    ds.attrs['name'], ds.attrs['level'])
+            ds.attrs[INFO.SHAPE] = ds.shape
+            ds.attrs[INFO.UNITS] = ds.attrs.get('units')
+            generate_guidebook_metadata(ds.attrs)
+
+            # Generate FAMILY and CATEGORY
+            if 'model_time' in ds.attrs:
+                model_time = ds.attrs['model_time'].isoformat()
+            else:
+                model_time = None
+            ds.attrs[INFO.SCENE] = hash(ds.attrs['area'])
+            if ds.attrs.get(INFO.CENTRAL_WAVELENGTH) is None:
+                cw = ""
+            else:
+                cw = ":{:5.2f}µm".format(ds.attrs[INFO.CENTRAL_WAVELENGTH])
+            ds.attrs[INFO.FAMILY] = '{}:{}:{}{}'.format(
+                ds.attrs[INFO.KIND].name, ds.attrs[INFO.STANDARD_NAME],
+                ds.attrs[INFO.SHORT_NAME], cw)
+            ds.attrs[INFO.CATEGORY] = 'SatPy:{}:{}:{}'.format(
+                ds.attrs[INFO.PLATFORM].name, ds.attrs[INFO.INSTRUMENT].name,
+                ds.attrs[INFO.SCENE])  # system:platform:instrument:target
+            # TODO: Include level or something else in addition to time?
+            start_str = ds.attrs['start_time'].isoformat()
+            ds.attrs[INFO.SERIAL] = start_str if model_time is None else model_time + ":" + start_str
+
+        return self.scn
+
+    def _area_to_sift_attrs(self, area):
+        """Area to sift keys"""
+        from pyresample.geometry import AreaDefinition
+        if not isinstance(area, AreaDefinition):
+            raise NotImplementedError("Only AreaDefinition datasets can "
+                                      "be loaded at this time.")
+
+        half_pixel_x = abs(area.pixel_size_x) / 2.
+        half_pixel_y = abs(area.pixel_size_y) / 2.
+
+        return {
+            INFO.PROJ: area.proj4_string,
+            INFO.ORIGIN_X: area.area_extent[0] + half_pixel_x,
+            INFO.ORIGIN_Y: area.area_extent[3] - half_pixel_y,
+            INFO.CELL_HEIGHT: -abs(area.pixel_size_y),
+            INFO.CELL_WIDTH: area.pixel_size_x,
+        }
+
+    def begin_import_products(self, *product_ids) -> Generator[import_progress, None, None]:
+        import dask.array as da
+
+        if product_ids:
+            products = [self._S.query(Product).filter_by(id=anid).one() for anid in product_ids]
+            assert products
+        else:
+            products = list(self._S.query(Resource, Product).filter(
+                Resource.path.in_(self.filenames)).filter(
+                Product.resource_id == Resource.id).all())
+            assert products
+
+        # FIXME: Don't recreate the importer every time we want to load data
+        dataset_ids = [DatasetID.from_dict(prod.info) for prod in products]
+        self.scn.load(dataset_ids)
+        num_stages = len(products)
+        for idx, (prod, ds_id) in enumerate(zip(products, dataset_ids)):
+            dataset = self.scn[ds_id]
+            shape = dataset.shape
+            num_contents = 1 if prod.info[INFO.KIND] == KIND.IMAGE else 2
+
+            if prod.content:
+                LOG.warning('content was already available, skipping import')
+                continue
+
+            now = datetime.utcnow()
+            area_info = self._area_to_sift_attrs(dataset.attrs['area'])
+            cell_width = area_info[INFO.CELL_WIDTH]
+            cell_height = area_info[INFO.CELL_HEIGHT]
+            proj4 = area_info[INFO.PROJ]
+            origin_x = area_info[INFO.ORIGIN_X]
+            origin_y = area_info[INFO.ORIGIN_Y]
+            data = dataset.data
+
+            # Handle building contours for data from 0 to 360 longitude
+            antimeridian = 179.999
+            if '+proj=latlong' not in proj4:
+                # the x coordinate for the antimeridian in this projection
+                antimeridian = Proj(proj4)(antimeridian, 0)[0]
+            am_index = int(np.ceil((antimeridian - origin_x) / cell_width))
+            if prod.info[INFO.KIND] == KIND.CONTOUR and 0 < am_index < shape[1]:
+                # if we have data from 0 to 360 longitude, we want -180 to 360
+                data = da.concatenate((data[:, am_index:], data), axis=1)
+                shape = data.shape
+                origin_x -= am_index * cell_width
+
+            # shovel that data into the memmap incrementally
+            data_filename = '{}.image'.format(prod.uuid)
+            data_path = os.path.join(self._cwd, data_filename)
+            img_data = np.memmap(data_path, dtype=np.float32, shape=shape, mode='w+')
+            da.store(data, img_data)
+
+            c = Content(
+                lod=0,
+                resolution=int(min(abs(cell_width), abs(cell_height))),
+                atime=now,
+                mtime=now,
+
+                # info about the data array memmap
+                path=data_filename,
+                rows=shape[0],
+                cols=shape[1],
+                proj4=proj4,
+                # levels = 0,
+                dtype='float32',
+
+                # info about the coverage array memmap, which in our case just tells what rows are ready
+                # coverage_rows = rows,
+                # coverage_cols = 1,
+                # coverage_path = coverage_filename
+
+                cell_width=cell_width,
+                cell_height=cell_height,
+                origin_x=origin_x,
+                origin_y=origin_y,
+            )
+            c.info[INFO.KIND] = KIND.IMAGE
+            # c.info.update(prod.info) would just make everything leak together so let's not do it
+            self._S.add(c)
+            prod.content.append(c)
+            # prod.touch()
+            self._S.commit()
+
+            yield import_progress(uuid=prod.uuid,
+                                  stages=num_stages,
+                                  current_stage=idx,
+                                  completion=1. / num_contents,
+                                  stage_desc="SatPy image data add to workspace",
+                                  dataset_info=None,
+                                  data=img_data)
+
+            if num_contents == 1:
+                continue
+
+            if find_contours is None:
+                raise RuntimeError("Can't create contours without 'skimage' "
+                                   "package installed.")
+
+            # XXX: Should/could 'lod' be used for different contour level data?
+            levels = [x for y in prod.info['contour_levels'] for x in y]
+            data_filename = '{}.contour'.format(prod.uuid)
+            data_path = os.path.join(self._cwd, data_filename)
+            try:
+                contour_data = self._compute_contours(
+                        img_data, prod.info[INFO.VALID_RANGE][0],
+                        prod.info[INFO.VALID_RANGE][1], levels)
+            except ValueError:
+                LOG.warning("Could not compute contour levels for '{}'".format(prod.uuid))
+                LOG.debug("Contour error: ", exc_info=True)
+                continue
+
+            contour_data[:, 0] *= cell_width
+            contour_data[:, 0] += origin_x
+            contour_data[:, 1] *= cell_height
+            contour_data[:, 1] += origin_y
+            contour_data.tofile(data_path)
+            c = Content(
+                lod=0,
+                resolution=int(min(abs(cell_width), abs(cell_height))),
+                atime=now,
+                mtime=now,
+
+                # info about the data array memmap
+                path=data_filename,
+                rows=contour_data.shape[0],  # number of vertices
+                cols=contour_data.shape[1],  # col (x), row (y), "connect", num_points_for_level
+                proj4=proj4,
+                # levels = 0,
+                dtype='float32',
+
+                cell_width=cell_width,
+                cell_height=cell_height,
+                origin_x=origin_x,
+                origin_y=origin_y,
+            )
+            c.info[INFO.KIND] = KIND.CONTOUR
+            # c.info["level_index"] = level_indexes
+            self._S.add(c)
+            prod.content.append(c)
+            self._S.commit()
+
+            completion = 2. / num_contents
+            yield import_progress(uuid=prod.uuid,
+                                  stages=num_stages,
+                                  current_stage=idx,
+                                  completion=completion,
+                                  stage_desc="SatPy contour data add to workspace",
+                                  dataset_info=None,
+                                  data=img_data)
+
+    def _get_verts_and_connect(self, paths):
+        """ retrieve vertices and connects from given paths-list
+        """
+        # THIS METHOD WAS COPIED FROM VISPY
+        verts = np.vstack(paths)
+        gaps = np.add.accumulate(np.array([len(x) for x in paths])) - 1
+        connect = np.ones(gaps[-1], dtype=bool)
+        connect[gaps[:-1]] = False
+        return verts, connect
+
+    def _compute_contours(self, img_data: np.ndarray,
+                          vmin: float, vmax: float,
+                          levels: list) -> np.ndarray:
+        all_levels = []
+        level_indexes = []
+        for level in levels:
+            if level < vmin or level > vmax:
+                continue
+
+            contours = find_contours(img_data, level,
+                                     positive_orientation='high')
+            if not contours:
+                LOG.debug("No contours found for level: {}".format(level))
+                continue
+            v, c = self._get_verts_and_connect(contours)
+            # swap row, column to column, row (x, y)
+            v[:, [0, 1]] = v[:, [1, 0]]
+            v += np.array([0.5, 0.5])
+            v[:, 0] = np.where(np.isnan(v[:, 0]), 0, v[:, 0])
+
+            # HACK: Store float vertices, boolean, and index arrays together in one float array
+            this_level = np.empty((v.shape[0],), np.float32)
+            this_level[:] = np.nan
+            this_level[-1] = v.shape[0]
+            level_indexes.append(v.shape[0])
+            c = np.concatenate((c, [False])).astype(np.float32)
+            # level_data = np.concatenate((v, c[:, None]), axis=1)
+            level_data = np.concatenate((v, c[:, None], this_level[:, None]), axis=1)
+            all_levels.append(level_data)
+
+        if not all_levels:
+            raise ValueError("No valid contour levels")
+        return np.concatenate(all_levels).astype(np.float32)
 
 
 PATH_TEST_DATA = os.environ.get('TEST_DATA', os.path.expanduser("~/Data/test_files/thing.dat"))

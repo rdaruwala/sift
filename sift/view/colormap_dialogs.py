@@ -2,8 +2,7 @@ import logging
 from functools import partial
 from uuid import UUID
 from PyQt4 import QtGui, QtCore
-from sift.common import INFO
-from sift.view.Colormap import CATEGORIZED_COLORMAPS
+from sift.common import INFO, KIND
 from sift.ui.change_colormap_dialog_ui import Ui_changeColormapDialog
 
 LOG = logging.getLogger(__name__)
@@ -42,6 +41,10 @@ class ChangeColormapDialog(QtGui.QDialog):
         self.ui.gammaSpinBox.setValue(self._initial_gamma)
 
         self.ui.buttons.clicked.connect(self._clicked)
+        close_button = self.ui.buttons.button(QtGui.QDialogButtonBox.Close)
+        close_button.setAutoDefault(True)
+        reset_button = self.ui.buttons.button(QtGui.QDialogButtonBox.Reset)
+        reset_button.setAutoDefault(False)
         self.ui.buttons.accepted.disconnect()
         self.ui.buttons.rejected.disconnect()
 
@@ -50,7 +53,11 @@ class ChangeColormapDialog(QtGui.QDialog):
         self.ui.vmax_slider.sliderReleased.connect(partial(self._slider_changed, is_max=True))
         self.ui.vmin_edit.editingFinished.connect(partial(self._edit_changed, is_max=False))
         self.ui.vmax_edit.editingFinished.connect(partial(self._edit_changed, is_max=True))
-        self.ui.gammaSpinBox.valueChanged.connect(self._gamma_changed)
+
+        if layer[INFO.KIND] in [KIND.CONTOUR]:
+            self.ui.gammaSpinBox.setDisabled(True)
+        else:
+            self.ui.gammaSpinBox.valueChanged.connect(self._gamma_changed)
 
     def _clicked(self, button):
         r = self.ui.buttons.buttonRole(button)
@@ -99,13 +106,11 @@ class ChangeColormapDialog(QtGui.QDialog):
         return self._set_new_clims(val, is_max)
 
     def _init_cmap_combo(self):
-        idx = 0
-        for cat, cat_colormaps in CATEGORIZED_COLORMAPS.items():
-            for colormap in cat_colormaps.keys():
-                self.ui.cmap_combobox.addItem(colormap, colormap)
-                if colormap == self._initial_cmap:
-                    self.ui.cmap_combobox.setCurrentIndex(idx)
-                idx += 1
+        # FIXME: We should do this by colormap category
+        for idx, colormap in enumerate(self.doc.colormaps.keys()):
+            self.ui.cmap_combobox.addItem(colormap, colormap)
+            if colormap == self._initial_cmap:
+                self.ui.cmap_combobox.setCurrentIndex(idx)
 
     def _get_slider_value(self, slider_val):
         return (slider_val / self._slider_steps) * (self.valid_max - self.valid_min) + self.valid_min

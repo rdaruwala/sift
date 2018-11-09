@@ -35,11 +35,13 @@ __docformat__ = 'reStructuredText'
 
 import logging, sys, os
 import pickle as pkl
-from PyQt4.QtCore import QAbstractItemModel, QAbstractListModel, Qt, QSize, QModelIndex, QPoint, QMimeData, pyqtSignal, QRect
-from PyQt4.QtGui import QTreeView, QStyledItemDelegate, QAbstractItemView, QMenu, QStyle, QColor, QFont, QStyleOptionViewItem, QItemSelection, QItemSelectionModel, QPen
-from sift.model.document import Document
-from sift.common import INFO, KIND
-from sift.view.Colormap import ALL_COLORMAPS, CATEGORIZED_COLORMAPS
+from PyQt4.QtCore import QAbstractItemModel, Qt, QSize, QModelIndex, QPoint, QMimeData, pyqtSignal, QRect
+from PyQt4.QtGui import (QTreeView, QStyledItemDelegate, QAbstractItemView,
+                         QMenu, QStyle, QColor, QFont, QStyleOptionViewItem,
+                         QItemSelection, QItemSelectionModel, QPen,
+                         QActionGroup, QAction)
+from sift.model.document import Document, DocumentAsLayerStack
+from sift.common import INFO, KIND, get_font_size
 from sift.view.colormap_dialogs import ChangeColormapDialog
 
 LOG = logging.getLogger(__name__)
@@ -58,7 +60,8 @@ class LayerWidgetDelegate(QStyledItemDelegate):
     set for a specific column, controls the rendering and editing of items in that column or row of a list or table
     see QAbstractItemView.setItemDelegateForRow/Column
     """
-    _doc = None  # document we're representing
+    _doc: Document = None  # document we're representing
+    # _doc: DocumentAsLayerStack = None  # document we're representing
 
     def layer_prez(self, index:int):
         cll = self._doc.current_layer_set
@@ -67,7 +70,10 @@ class LayerWidgetDelegate(QStyledItemDelegate):
     def __init__(self, doc:Document, *args, **kwargs):
         super(LayerWidgetDelegate, self).__init__(*args, **kwargs)
         self._doc = doc
-        self.font = QFont('Andale Mono', 12) if 'darwin' in sys.platform else QFont('Andale Mono', 7)
+        # self._doc = doc.as_layer_stack
+        fsize = get_font_size(7)
+        self.font = QFont('Andale Mono')
+        self.font.setPointSizeF(fsize)
 
     def sizeHint(self, option:QStyleOptionViewItem, index:QModelIndex):
         pz = self.layer_prez(index.row())
@@ -95,7 +101,7 @@ class LayerWidgetDelegate(QStyledItemDelegate):
 
         # if we have a value, break out the animation order and other info
         animation_order = None
-        if value :
+        if value:
             value, animation_order = value
 
         # if we have a point probe value, draw the filled bar to represent where it is in that layer's data range
@@ -232,9 +238,10 @@ class LayerStackTreeViewModel(QAbstractItemModel):
     _mimetype = 'application/vnd.row.list'
 
     # signals
-    uuidSelectionChanged = pyqtSignal(tuple,)  # the list is a list of the currently selected UUIDs
+    uuidSelectionChanged = pyqtSignal(tuple)  # the list is a list of the currently selected UUIDs
+    didRequestRGBCreation = pyqtSignal(dict)
 
-    def __init__(self, widgets:list, doc:Document, parent=None):
+    def __init__(self, widgets: list, doc: Document, parent=None):
         """
         Connect one or more table views to the document via this model.
         :param widgets: list of TableViews to wire up
@@ -391,10 +398,11 @@ class LayerStackTreeViewModel(QAbstractItemModel):
         :param doc_values: {uuid: value, value-relative-to-base, is-base:bool}, values can be NaN
         :return:
         """
-        self._last_equalizer_values.update(doc_values)
-        # for k in self._last_equalizer_values.keys():
-        #     if self._last_equalizer_values[k] is None:
-        #         del self._last_equalizer_values[k]
+        if not doc_values:
+            # turn off all equalizer values
+            self._last_equalizer_values = {}
+        else:
+            self._last_equalizer_values.update(doc_values)
         self.refresh()
 
     def change_layer_colormap_menu(self, menu, lbox:QTreeView, selected_uuids:list, *args):
@@ -422,7 +430,7 @@ class LayerStackTreeViewModel(QAbstractItemModel):
             request = requests.get(action, None)
             if request is not None:
                 LOG.debug('RGB creation using {0!r:s}'.format(request))
-                self.doc.create_rgb_composite(**request)
+                self.didRequestRGBCreation.emit(request)
 
         rgb_menu = QMenu("Create RGB From Selections...", menu)
         for rgb in sorted(set(x[:len(selected_uuids)] for x in ['RGB', 'RBG', 'GRB', 'GBR', 'BRG', 'BGR']), reverse=True):
@@ -435,6 +443,31 @@ class LayerStackTreeViewModel(QAbstractItemModel):
         menu.addMenu(rgb_menu)
         return actions
 
+    def change_layer_image_kind_menu(self, menu, lbox, selected_uuids, *args):
+        current_kind = self.doc.prez_for_uuid(selected_uuids[0]).kind
+        kind_menu = QMenu("Change Image Kind", menu)
+        action_group = QActionGroup(menu, exclusive=True)
+        actions = {}
+        action_kinds = {}
+
+        def _change_layers_image_kind(action, action_kinds=action_kinds):
+            if not action.isChecked():
+                # can't uncheck an image kind
+                LOG.debug("Selected KIND action is not checked")
+                return
+            kind = action_kinds[action]
+            return self.doc.change_layers_image_kind(selected_uuids, kind)
+
+        for kind in [KIND.IMAGE, KIND.CONTOUR]:
+            action = action_group.addAction(QAction(kind.name, menu, checkable=True))
+            action_kinds[action] = kind
+            action.setChecked(kind == current_kind)
+            actions[action] = _change_layers_image_kind
+            kind_menu.addAction(action)
+
+        menu.addMenu(kind_menu)
+        return actions
+
     def menu(self, pos: QPoint, *args):
         lbox = self.current_set_listbox
         selected_uuids = list(self.current_selected_uuids(lbox))
@@ -442,10 +475,15 @@ class LayerStackTreeViewModel(QAbstractItemModel):
         menu = QMenu()
         actions = {}
         if len(selected_uuids) == 1:
-            if self.doc[selected_uuids[0]][INFO.KIND] in [KIND.IMAGE, KIND.COMPOSITE]:
+            if self.doc[selected_uuids[0]][INFO.KIND] in [KIND.IMAGE, KIND.COMPOSITE, KIND.CONTOUR]:
                 actions.update(self.change_layer_colormap_menu(menu, lbox, selected_uuids, *args))
+            if self.doc[selected_uuids[0]][INFO.KIND] in [KIND.CONTOUR]:
+                actions.update(self.change_layer_image_kind_menu(menu, lbox, selected_uuids, *args))
         if 0 < len(selected_uuids) <= 3:
-            actions.update(self.composite_layer_menu(menu, lbox, selected_uuids, *args))
+            if all(self.doc[u][INFO.KIND] in [KIND.IMAGE, KIND.COMPOSITE]
+                   for u in selected_uuids):
+                actions.update(self.composite_layer_menu(
+                    menu, lbox, selected_uuids, *args))
 
         if not actions:
             action = menu.addAction("No actions available for this layer")

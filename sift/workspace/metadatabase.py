@@ -33,10 +33,10 @@ __docformat__ = 'reStructuredText'
 import os, sys
 import logging, unittest, argparse
 from datetime import datetime, timedelta
-from sift.common import INFO
+from sift.common import INFO, FCS_SEP
 from functools import reduce
 from uuid import UUID
-from collections import ChainMap, MutableMapping, Iterable
+from collections import ChainMap, MutableMapping, Iterable, defaultdict
 from typing import Mapping
 
 from sqlalchemy import Table, Column, Integer, String, UnicodeText, Unicode, ForeignKey, DateTime, Interval, PickleType, Float, create_engine
@@ -92,9 +92,10 @@ Base = declarative_base()
 
 # resources can have multiple products in them
 # products may require multiple resourcse (e.g. separate GEO; tiled imagery)
-ProductsFromResources = Table('product_resource_assoc_v0', Base.metadata,
-                              Column('product_id', Integer, ForeignKey('products_v0.id')),
-                              Column('resource_id', Integer, ForeignKey('resources_v0.id')))
+PRODUCTS_FROM_RESOURCES_TABLE_NAME = 'product_resource_assoc_v1'
+ProductsFromResources = Table(PRODUCTS_FROM_RESOURCES_TABLE_NAME, Base.metadata,
+                              Column('product_id', Integer, ForeignKey('products_v1.id')),
+                              Column('resource_id', Integer, ForeignKey('resources_v1.id')))
 
 
 
@@ -103,7 +104,7 @@ class Resource(Base):
     held metadata regarding a file that we can access and import data into the workspace from
     resources are external to the workspace, but the workspace can keep track of them in its database
     """
-    __tablename__ = 'resources_v0'
+    __tablename__ = 'resources_v1'
     # identity information
     id = Column(Integer, primary_key=True)
 
@@ -206,7 +207,7 @@ class Product(Base):
     A StoredProduct's kind determines how its cached data is transformed to different representations for display
     additional information is stored in a key-value table addressable as product[key:str]
     """
-    __tablename__ = 'products_v0'
+    __tablename__ = 'products_v1'
 
     # identity information
     id = Column(Integer, primary_key=True)
@@ -228,6 +229,34 @@ class Product(Base):
 
     # cached metadata provided by the file format handler
     name = Column(String, nullable=False)  # product identifier eg "B01", "B02"  # resource + shortname should be sufficient to identify the data
+
+    # presentation is consistent within a family
+    # family::category determines track, which should represent a product sequence in time
+    # family::category::serial is effectively a product unique identifier
+    family = Column(Unicode, nullable=False)  # colon-separated family identifier, typically kind:pointofreference:measurement:wavelength, e.g. image:geo:refl:11µ
+                                              #  with <> used for generated content.
+    category = Column(Unicode, nullable=False)  # colon-separated processing-system, platform, instrument and scene name, typically system:platform:instrument:target e.g. NOAA-PUG:GOES-16:ABI:CONUS
+    serial = Column(Unicode, nullable=False)  # serial number within family and category; typically time-related; use ISO8601 times please
+
+    @property
+    def track(self):
+        """track is family::category
+        """
+        return self.family + FCS_SEP + self.category
+
+    @track.setter
+    def track(self, new_track: str):
+        fam, ctg = new_track.split("::")
+        self.family, self.category = fam, ctg
+
+    @property
+    def ident(self):
+        return self.family + FCS_SEP + self.category + FCS_SEP + self.serial
+
+    @ident.setter
+    def ident(self, new_ident: str):
+        fam, ctg, ser = new_ident.split("::")
+        self.family, self.category, self.serial = fam, ctg, ser
 
     # platform = Column(String)  # platform or satellite name e.g. "GOES-16", "Himawari-8"; should match PLATFORM enum
     # standard_name = Column(String, nullable=True)
@@ -383,9 +412,9 @@ class Product(Base):
 
     @property
     def path(self):
-        # if len(self.resource) > 1:
-        #     LOG.warning('Product {} has more than one resource, path is ambiguous'.format(self.name))
-        return self.resource[0].path  # FIXME if len(self.resource)==1 else None
+        if len(self.resource) > 1:
+            LOG.warning('Product {} has more than one resource, path is ambiguous'.format(self.name))
+        return self.resource[0].path if len(self.resource) == 1 else None
 
     @path.setter
     def path(self, value):
@@ -404,7 +433,10 @@ class Product(Base):
         INFO.CELL_WIDTH: 'cell_width',
         INFO.CELL_HEIGHT: 'cell_height',
         INFO.ORIGIN_X: 'origin_x',
-        INFO.ORIGIN_Y: 'origin_y'
+        INFO.ORIGIN_Y: 'origin_y',
+        INFO.FAMILY: 'family',
+        INFO.CATEGORY: 'category',
+        INFO.SERIAL: 'serial'
     }
 
     def touch(self, when=None):
@@ -415,7 +447,7 @@ class ProductKeyValue(Base):
     """
     key-value pairs associated with a product
     """
-    __tablename__ = 'product_key_values_v0'
+    __tablename__ = 'product_key_values_v1'
     product_id = Column(ForeignKey(Product.id), primary_key=True)
     key = Column(PickleType, primary_key=True)  # FUTURE: can this be a string? for now need pickling of INFO/PLATFORM Enum
     # relationship: .product
@@ -425,7 +457,7 @@ class SymbolKeyValue(Base):
     """
     derived layers have a symbol table which becomes namespace used by expression
     """
-    __tablename__ = 'algebraic_symbol_key_values_v0'
+    __tablename__ = 'algebraic_symbol_key_values_v1'
     product_id = Column(ForeignKey(Product.id), primary_key=True)
     key = Column(Unicode, primary_key=True)
     # relationship: .product
@@ -443,7 +475,7 @@ class Content(Base):
     """
     # _array = None  # when attached, this is a np.memmap
 
-    __tablename__ = 'contents_v0'
+    __tablename__ = 'contents_v1'
     id = Column(Integer, primary_key=True)
     product_id = Column(Integer, ForeignKey(Product.id))
 
@@ -637,7 +669,7 @@ class ContentKeyValue(Base):
     """
     key-value pairs associated with a product
     """
-    __tablename__ = 'content_key_values_v0'
+    __tablename__ = 'content_key_values_v1'
     product_id = Column(ForeignKey(Content.id), primary_key=True)
     key = Column(PickleType, primary_key=True)  # FUTURE: can this be a string?
     value = Column(PickleType)
@@ -654,8 +686,10 @@ class Metadatabase(object):
     engine = None
     connection = None
     session_factory = None
+    session_nesting = None
 
     def __init__(self, uri=None, **kwargs):
+        self.session_nesting = defaultdict(int)
         global _MDB
         if _MDB is not None:
             raise AssertionError('Metadatabase is a singleton and already exists')
@@ -670,12 +704,25 @@ class Metadatabase(object):
             _MDB = Metadatabase(*args, **kwargs)
         return _MDB
 
+    def _all_tables_present(self):
+        from sqlalchemy.engine.reflection import Inspector
+        inspector = Inspector.from_engine(self.engine)
+        all_tables = set(inspector.get_table_names())
+        zult = True
+        for table_name in (Resource.__tablename__, Product.__tablename__,
+                           ProductKeyValue.__tablename__, SymbolKeyValue.__tablename__,
+                           Content.__tablename__, ContentKeyValue.__tablename__, PRODUCTS_FROM_RESOURCES_TABLE_NAME):
+            present = table_name in all_tables
+            LOG.debug("table {} {} present in database".format(table_name, "is" if present else "is not"))
+            zult = False if not present else zult
+        return zult
+
     def connect(self, uri, create_tables=False, **kwargs):
         assert(self.engine is None)
         assert(self.connection is None)
         self.engine = create_engine(uri, **kwargs)
         LOG.info('attaching database at {}'.format(uri))
-        if create_tables:
+        if create_tables or not self._all_tables_present():
             LOG.info("creating database tables")
             Base.metadata.create_all(self.engine)
         self.connection = self.engine.connect()
@@ -686,16 +733,34 @@ class Metadatabase(object):
     def session(self):
         return self.session_factory()
 
-    def __enter__(self):
-        return self.SessionRegistry()
+    def __enter__(self) -> Session:
+        ses = self.SessionRegistry()
+        self.session_nesting[id(ses)] += 1
+        return ses
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        # fetch the active session, typically zero or one active per thread
         s = self.SessionRegistry()
-        if exc_val is not None:
-            s.rollback()
-        else:
-            s.commit()
-        s.close()
+        self.session_nesting[id(s)] -= 1
+        # LOG.debug("database session nesting now at {}".format(self.session_nesting[id(s)]))
+        if self.session_nesting[id(s)] <= 0:
+            if exc_val is not None:
+                LOG.warning("an exception occurred, rolling back any metadatabase changes")
+                s.rollback()
+            else:
+                if bool(s.dirty) or bool(s.new) or bool(s.deleted):
+                    LOG.debug("committing metadatabase changes")
+                    s.commit()
+                else:
+                    LOG.debug("closing clean database session without commit")
+                    # LOG.debug("session is clean but committing before close anyway")
+                    # s.commit()
+            s.close()
+            del self.session_nesting[id(s)]
+        else:  # we're in a nested context for this session
+            if exc_val is not None:  # propagate the exception to the outermost session context
+                LOG.warning('propagating database exception to outermost context')
+                raise exc_val
 
     #
     # high-level functions

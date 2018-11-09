@@ -42,35 +42,34 @@ DEFAULT_POINT_PROBE = "default_probe_name"
 
 
 class NavigationToolbar(NavigationToolbar):
-    """Custom matplotlib toolbar
-    """
+    """Custom matplotlib toolbar."""
+    def __init__(self, *args, **kwargs):
+        self.__include_colorbar = kwargs.get('include_colorbar', False)
+        super(NavigationToolbar, self).__init__(*args, **kwargs)
+
     def edit_parameters(self):
         allaxes = self.canvas.figure.get_axes()
-        if len(allaxes) == 1:
-            axes = allaxes[0]
+        if not allaxes:
+            QtWidgets.QMessageBox.warning(
+                self.parent, "Error", "There are no axes to edit.")
+            return
+        elif len(allaxes) == 1:
+            axes, = allaxes
         else:
             titles = []
-            for axes in allaxes:
-                title = axes.get_title()
-                ylabel = axes.get_ylabel()
-                label = axes.get_label()
-                if title:
-                    fmt = "%(title)s"
-                    # if ylabel:
-                    #     fmt += ": %(ylabel)s"
-                    # fmt += " (%(axes_repr)s)"
-                elif ylabel:
-                    fmt = "%(axes_repr)s (%(ylabel)s)"
-                elif label:
-                    fmt = "%(axes_repr)s (%(label)s)"
-                else:
-                    fmt = "%(axes_repr)s"
-                titles.append(fmt % dict(title=title,
-                                         ylabel=ylabel, label=label,
-                                         axes_repr=repr(axes)))
-            if len(titles) == 2 and "Colorbar" in titles:
-                other_idx = titles.index("Colorbar") - 1
-                axes = allaxes[other_idx]
+            not_colorbar_idx = -1
+            for idx, axes in enumerate(allaxes):
+                if any(x.colorbar for x in axes.images):
+                    not_colorbar_idx = idx
+                name = (axes.get_title() or
+                        " - ".join(filter(None, [axes.get_xlabel(),
+                                                 axes.get_ylabel()])) or
+                        "<anonymous {} (id: {:#x})>".format(
+                            type(axes).__name__, id(axes)))
+                titles.append(name)
+
+            if len(titles) == 2 and not_colorbar_idx != -1 and not self.__include_colorbar:
+                axes = allaxes[not_colorbar_idx]
             else:
                 item, ok = QtWidgets.QInputDialog.getItem(
                     self.parent, 'Customize', 'Select axes:', titles, 0, False)
@@ -81,9 +80,9 @@ class NavigationToolbar(NavigationToolbar):
 
         figureoptions.figure_edit(axes, self)
 
-class ProbeGraphManager (QObject) :
-    """The ProbeGraphManager manages the many tabs of the Area Probe Graphs.
-    """
+
+class ProbeGraphManager(QObject):
+    """The ProbeGraphManager manages the many tabs of the Area Probe Graphs."""
 
     # signals
     didChangeTab = pyqtSignal(tuple,)  # list of probe areas to show
@@ -582,13 +581,18 @@ class ProbeGraphDisplay (object) :
             yield {TASK_DOING: 'Probe Plot: Collecting polygon data (layer 1)...', TASK_PROGRESS: 0.0}
 
             # get the data and info we need for this plot
-            name1 = self.document[x_uuid][INFO.DISPLAY_NAME]
-            name2 = self.document[y_uuid][INFO.DISPLAY_NAME]
+            x_info = self.document[x_uuid]
+            y_info = self.document[y_uuid]
+            name1 = x_info[INFO.DISPLAY_NAME]
+            name2 = y_info[INFO.DISPLAY_NAME]
             hires_uuid = self.workspace.lowest_resolution_uuid(x_uuid, y_uuid)
+            # hires_coord_mask are the lat/lon coordinates of each of the
+            # pixels in hires_data. The coordinates are (lat, lon) to resemble
+            # the (Y, X) indexing of numpy arrays
             hires_coord_mask, hires_data = self.workspace.get_coordinate_mask_polygon(hires_uuid, polygon)
             hires_conv_func = self.document[hires_uuid][INFO.UNIT_CONVERSION][1]
-            x_conv_func = self.document[x_uuid][INFO.UNIT_CONVERSION][1]
-            y_conv_func = self.document[y_uuid][INFO.UNIT_CONVERSION][1]
+            x_conv_func = x_info[INFO.UNIT_CONVERSION][1]
+            y_conv_func = y_info[INFO.UNIT_CONVERSION][1]
             hires_data = hires_conv_func(hires_data)
             yield {TASK_DOING: 'Probe Plot: Collecting polygon data (layer 2)...', TASK_PROGRESS: 0.15}
             if hires_uuid == x_uuid:
@@ -613,10 +617,10 @@ class ProbeGraphDisplay (object) :
                 y_point = None
 
             # plot a scatter plot
-            # self.plotScatterplot (data1, name1, data2, name2)
-            data1 = data1[~np.isnan(data1)]
-            data2 = data2[~np.isnan(data2)]
-            self.plotDensityScatterplot (data1, name1, data2, name2, x_point, y_point)
+            good_mask = ~(np.isnan(data1) | np.isnan(data2))
+            data1 = data1[good_mask]
+            data2 = data2[good_mask]
+            self.plotDensityScatterplot(data1, name1, data2, name2, x_point, y_point)
 
         # if we have some combination of selections we don't understand, clear the figure
         else :
@@ -699,7 +703,6 @@ class ProbeGraphDisplay (object) :
             axes.set_autoscale_on(True)
 
         colorbar = self.figure.colorbar(img)
-        colorbar.ax.set_title("Colorbar")  # for the 'Customize' menu in the MPL toolbar
         colorbar.set_label('log(count of data points)')
 
         # set the various text labels
@@ -710,7 +713,7 @@ class ProbeGraphDisplay (object) :
         # draw the x vs y line
         self._draw_xy_line(axes)
 
-    def clearPlot (self) :
+    def clearPlot(self):
         """Clear our plot
         """
 
@@ -721,10 +724,6 @@ class ProbeGraphDisplay (object) :
         # get the bounds for our calculations and so we can reset the viewing window later
         x_bounds = axes.get_xbound()
         y_bounds = axes.get_ybound()
-
-        # figure out the size of the ranges
-        xrange = x_bounds[1] - x_bounds[0]
-        yrange = y_bounds[1] - y_bounds[0]
 
         # draw the x=y line
         perfect = [max(x_bounds[0], y_bounds[0]), min(x_bounds[1], y_bounds[1])]

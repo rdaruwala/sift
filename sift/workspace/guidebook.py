@@ -65,102 +65,115 @@ DEFAULT_COLORMAPS = {
     'toa_bidirectional_reflectance': DEFAULT_VIS,
     'toa_brightness_temperature': DEFAULT_IR,
     'height_at_cloud_top': 'Cloud Top Height',
+    'air_temperature': DEFAULT_IR,
+    'relative_humidity': DEFAULT_IR,
     # 'thermodynamic_phase_of_cloud_water_particles_at_cloud_top': 'Cloud Phase',
 }
 
+_NW_GOESR_ABI = {
+    INSTRUMENT.ABI: {  # http://www.goes-r.gov/education/ABI-bands-quick-info.html
+        1: 0.47,
+        2: 0.64,
+        3: 0.86,
+        4: 1.37,
+        5: 1.6,
+        6: 2.2,
+        7: 3.9,
+        8: 6.2,
+        9: 6.9,
+        10: 7.3,
+        11: 8.4,
+        12: 9.6,
+        13: 10.3,
+        14: 11.2,
+        15: 12.3,
+        16: 13.3,
+    },
+}
+
+_NW_HIMAWARI_AHI = {
+    INSTRUMENT.AHI: {
+        1: 0.47,
+        2: 0.51,
+        3: 0.64,
+        4: 0.86,
+        5: 1.6,
+        6: 2.3,
+        7: 3.9,
+        8: 6.2,
+        9: 6.9,
+        10: 7.3,
+        11: 8.6,
+        12: 9.6,
+        13: 10.4,
+        14: 11.2,
+        15: 12.4,
+        16: 13.3,
+    },
+}
 
 # Instrument -> Band Number -> Nominal Wavelength
 NOMINAL_WAVELENGTHS = {
-    PLATFORM.HIMAWARI_8: {
-        INSTRUMENT.AHI: {
-            1: 0.47,
-            2: 0.51,
-            3: 0.64,
-            4: 0.86,
-            5: 1.6,
-            6: 2.3,
-            7: 3.9,
-            8: 6.2,
-            9: 6.9,
-            10: 7.3,
-            11: 8.6,
-            12: 9.6,
-            13: 10.4,
-            14: 11.2,
-            15: 12.4,
-            16: 13.3,
-        },
-    },
-    # PLATFORM.HIMAWARI_9: {
-    #     INSTRUMENT.AHI: {
-    #     },
-    # },
-    PLATFORM.GOES_16: {
-        INSTRUMENT.ABI: {  # http://www.goes-r.gov/education/ABI-bands-quick-info.html
-            1: 0.47,
-            2: 0.64,
-            3: 0.86,
-            4: 1.37,
-            5: 1.6,
-            6: 2.2,
-            7: 3.9,
-            8: 6.2,
-            9: 6.9,
-            10: 7.3,
-            11: 8.4,
-            12: 9.6,
-            13: 10.3,
-            14: 11.2,
-            15: 12.3,
-            16: 13.3,
-        },
-    },
+    PLATFORM.HIMAWARI_8: _NW_HIMAWARI_AHI,
+    PLATFORM.HIMAWARI_9: _NW_HIMAWARI_AHI,
+
+    PLATFORM.GOES_16: _NW_GOESR_ABI,
+    PLATFORM.GOES_17: _NW_GOESR_ABI,
 }
 
 # CF compliant Standard Names (should be provided by input files or the workspace)
 # Instrument -> Band Number -> Standard Name
-STANDARD_NAMES = {
-    PLATFORM.HIMAWARI_8: {
-        INSTRUMENT.AHI: {
-            1: "toa_bidirectional_reflectance",
-            2: "toa_bidirectional_reflectance",
-            3: "toa_bidirectional_reflectance",
-            4: "toa_bidirectional_reflectance",
-            5: "toa_bidirectional_reflectance",
-            6: "toa_bidirectional_reflectance",
-            7: "toa_brightness_temperature",
-            8: "toa_brightness_temperature",
-            9: "toa_brightness_temperature",
-            10: "toa_brightness_temperature",
-            11: "toa_brightness_temperature",
-            12: "toa_brightness_temperature",
-            13: "toa_brightness_temperature",
-            14: "toa_brightness_temperature",
-            15: "toa_brightness_temperature",
-            16: "toa_brightness_temperature",
-        },
-    },
-    PLATFORM.GOES_16: {
-        INSTRUMENT.ABI: {
-            1: "toa_bidirectional_reflectance",
-            2: "toa_bidirectional_reflectance",
-            3: "toa_bidirectional_reflectance",
-            4: "toa_bidirectional_reflectance",
-            5: "toa_bidirectional_reflectance",
-            6: "toa_bidirectional_reflectance",
-            7: "toa_brightness_temperature",
-            8: "toa_brightness_temperature",
-            9: "toa_brightness_temperature",
-            10: "toa_brightness_temperature",
-            11: "toa_brightness_temperature",
-            12: "toa_brightness_temperature",
-            13: "toa_brightness_temperature",
-            14: "toa_brightness_temperature",
-            15: "toa_brightness_temperature",
-            16: "toa_brightness_temperature",
-        },
+
+_SN_GOESR_ABI = {
+    INSTRUMENT.ABI: {
+        1: "toa_bidirectional_reflectance",
+        2: "toa_bidirectional_reflectance",
+        3: "toa_bidirectional_reflectance",
+        4: "toa_bidirectional_reflectance",
+        5: "toa_bidirectional_reflectance",
+        6: "toa_bidirectional_reflectance",
+        7: "toa_brightness_temperature",
+        8: "toa_brightness_temperature",
+        9: "toa_brightness_temperature",
+        10: "toa_brightness_temperature",
+        11: "toa_brightness_temperature",
+        12: "toa_brightness_temperature",
+        13: "toa_brightness_temperature",
+        14: "toa_brightness_temperature",
+        15: "toa_brightness_temperature",
+        16: "toa_brightness_temperature",
+    }
+}
+
+_SN_HIMAWARI_AHI = {
+    INSTRUMENT.AHI: {
+        1: "toa_bidirectional_reflectance",
+        2: "toa_bidirectional_reflectance",
+        3: "toa_bidirectional_reflectance",
+        4: "toa_bidirectional_reflectance",
+        5: "toa_bidirectional_reflectance",
+        6: "toa_bidirectional_reflectance",
+        7: "toa_brightness_temperature",
+        8: "toa_brightness_temperature",
+        9: "toa_brightness_temperature",
+        10: "toa_brightness_temperature",
+        11: "toa_brightness_temperature",
+        12: "toa_brightness_temperature",
+        13: "toa_brightness_temperature",
+        14: "toa_brightness_temperature",
+        15: "toa_brightness_temperature",
+        16: "toa_brightness_temperature",
     },
 }
+
+STANDARD_NAMES = {
+    PLATFORM.HIMAWARI_8: _SN_HIMAWARI_AHI,
+    PLATFORM.HIMAWARI_9: _SN_HIMAWARI_AHI,
+    PLATFORM.GOES_16: _SN_GOESR_ABI,
+    PLATFORM.GOES_17: _SN_GOESR_ABI,
+}
+
+
 
 
 class ABI_AHI_Guidebook(Guidebook):
@@ -213,12 +226,14 @@ class ABI_AHI_Guidebook(Guidebook):
                 z[INFO.STANDARD_NAME] = "." + str(z.get(INFO.SHORT_NAME))
 
         # Only needed for backwards compatibility with originally supported geotiffs
-        if INFO.UNITS not in info:
+        if not info.get(INFO.UNITS):
             standard_name = info.get(INFO.STANDARD_NAME, z.get(INFO.STANDARD_NAME))
             if standard_name == 'toa_bidirectional_reflectance':
                 z[INFO.UNITS] = '1'
             elif standard_name == 'toa_brightness_temperature':
                 z[INFO.UNITS] = 'kelvin'
+        if info.get(INFO.UNITS, z.get(INFO.UNITS)) in ['K', 'Kelvin']:
+            z[INFO.UNITS] = 'kelvin'
 
         return z
 
@@ -241,8 +256,11 @@ class ABI_AHI_Guidebook(Guidebook):
     def climits(self, dsi):
         # Valid min and max for colormap use for data values in file (unconverted)
         if self._is_refl(dsi):
-            # Reflectance/visible data limits
-            return -0.012, 1.192
+            lims = (-0.012, 1.192)
+            if dsi[INFO.UNITS] == '%':
+                # Reflectance/visible data limits
+                lims = (lims[0] * 100., lims[1] * 100.)
+            return lims
         elif self._is_bt(dsi):
             # BT data limits
             return -109.0 + 273.15, 55 + 273.15
@@ -250,6 +268,8 @@ class ABI_AHI_Guidebook(Guidebook):
             return dsi["valid_min"], dsi["valid_max"]
         elif "flag_values" in dsi:
             return min(dsi["flag_values"]), max(dsi["flag_values"])
+        elif "valid_range" in dsi:
+            return dsi['valid_range']
         elif INFO.VALID_RANGE in dsi:
             return dsi[INFO.VALID_RANGE]
         else:
@@ -267,6 +287,11 @@ class ABI_AHI_Guidebook(Guidebook):
         when = ds_info.get(INFO.SCHED_TIME, ds_info.get(INFO.OBS_TIME))
         if when is None:
             dtime = '--:--:--'
+        elif 'model_time' in ds_info:
+            dtime = "{}Z +{}h".format(
+                ds_info['model_time'].strftime('%Y-%m-%d %H:%M'),
+                when.strftime('%H')
+            )
         else:
             dtime = when.strftime('%Y-%m-%d %H:%M:%S')
         return dtime

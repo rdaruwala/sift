@@ -24,6 +24,7 @@ __docformat__ = 'reStructuredText'
 
 import os, sys
 import logging, unittest, argparse
+from collections import OrderedDict
 from PyQt4.QtCore import QObject, pyqtSignal, QThread
 
 LOG = logging.getLogger(__name__)
@@ -44,17 +45,18 @@ class Worker(QThread):
     depth = 0
 
     workerDidMakeProgress = pyqtSignal(int, list)  # worker id, sequence of dictionaries listing update information to be propagated to view
+    workerDidCompleteTask = pyqtSignal(str, bool)  # task-key, ok: False if exception occurred else True
 
     def __init__(self, myid:int):
         super(Worker, self).__init__()
-        self.queue = []
+        self.queue = OrderedDict()
         self.depth = 0
         self.id = myid
 
     def add(self, key, task_iterable):
         # FUTURE: replace queued task if key matches
-        self.queue.append(task_iterable)
-        self.depth += 1
+        self.queue[key] = task_iterable
+        self.depth = len(self.queue)
         self.start()
 
     def _did_progress(self, task_status):
@@ -69,13 +71,17 @@ class Worker(QThread):
 
     def run(self):
         while len(self.queue)>0:
-            task = self.queue.pop(0)
+            key, task = self.queue.popitem(last=False)
+            # LOG.debug('starting background work on {}'.format(key))
+            ok = True
             try:
                 for status in task:
                     self._did_progress(status)
             except Exception:
-                LOG.error("Background task failed")
-                LOG.debug("Background task exception: ", exc_info=True)
+                # LOG.error("Background task failed")
+                LOG.error("Background task exception: ", exc_info=True)
+                ok = False
+            self.workerDidCompleteTask.emit(key, ok)
         self.depth = 0
         self._did_progress(None)
 
@@ -91,6 +97,7 @@ class TaskQueue(QObject):
     workers = None  # thread pool for background activity
     _interactive_round_robin = 0  # swaps between 0 and 1 for interactive tasks
     _last_status = None  # list of last status reports for different workers
+    _completion_futures = None  # dictionary of id(task) : completion(bool)
 
     didMakeProgress = pyqtSignal(list)  # sequence of dictionaries listing update information to be propagated to view
     # started : inherited
@@ -101,11 +108,13 @@ class TaskQueue(QObject):
         super(TaskQueue, self).__init__()
         self._interactive_round_robin = 0
         self.process_pool = process_pool
+        self._completion_futures = {}
         self._last_status = []
         self.workers = []
         for id in range(3):
             worker = Worker(id)
             worker.workerDidMakeProgress.connect(self._did_progress)
+            worker.workerDidCompleteTask.connect(self._did_complete_task)
             self.workers.append(worker)
             self._last_status.append(None)
 
@@ -121,7 +130,7 @@ class TaskQueue(QObject):
     def remaining(self):
         return sum([len(x.queue) for x in self.workers])
 
-    def add(self, key, task_iterable, description, interactive=False, use_process_pool=False, use_thread_pool=False):
+    def add(self, key, task_iterable, description, interactive=False, and_then=None, use_process_pool=False, use_thread_pool=False):
         """
         Add an iterable task which will yield progress information dictionaries.
 
@@ -141,6 +150,8 @@ class TaskQueue(QObject):
             self._interactive_round_robin %= 2
         else:
             wdex = 2
+        if callable(and_then):
+            self._completion_futures[key] = and_then
         self.workers[wdex].add(key, task_iterable)
 
     def _did_progress(self, worker_id, worker_status):
@@ -163,6 +174,15 @@ class TaskQueue(QObject):
         # otherwise this is a notification that we're finally at full idle
         self.didMakeProgress.emit([{TASK_DOING: '', TASK_PROGRESS: 0.0}])
         # FUTURE: consider one progress bar per worker
+
+    def _did_complete_task(self, task_key: str, succeeded: bool):
+        # LOG.debug("background task complete!")
+        todo = self._completion_futures.pop(task_key, None)
+        if callable(todo):
+            LOG.debug("completed task {}, and_then we do this...".format(succeeded))
+            todo(succeeded)
+        # else:
+        #     LOG.debug("nothing further to do <{}>".format(repr(todo)))
 
     def progress_ratio(self, current_progress=None):
         depth = self.depth

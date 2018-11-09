@@ -22,30 +22,53 @@ __docformat__ = 'reStructuredText'
 
 from uuid import UUID
 from vispy import app
-app_object = app.use_app('pyqt4')
-QtCore = app_object.backend_module.QtCore
-QtGui = app_object.backend_module.QtGui
+import asyncio
+from PyQt4 import QtGui
+from quamash import QEventLoop, QThreadExecutor
+from collections import OrderedDict
 
 import sift.ui.open_cache_dialog_ui as open_cache_dialog_ui
-from sift.control.LayerManager import LayerSetsManager
-from sift.model.document import Document, DocLayer
+from sift.control.layer_info import SingleLayerInfoPane
+from sift.control.layer_tree import LayerStackTreeViewModel
+from sift.control.rgb_behaviors import UserModifiesRGBLayers
+from sift.control.doc_ws_as_timeline_scene import SiftDocumentAsFramesInTracks
+from sift.model.document import Document
+from sift.model.layer import DocRGBLayer
+from sift.view.rgb_config import RGBLayerConfigPane
 from sift.view.SceneGraphManager import SceneGraphManager
 from sift.view.ProbeGraphs import ProbeGraphManager, DEFAULT_POINT_PROBE
 from sift.view.export_image import ExportImageHelper
 from sift.view.create_algebraic import CreateAlgebraicDialog
 from sift.queue import TaskQueue, TASK_PROGRESS, TASK_DOING
 from sift.workspace import Workspace
+from sift.workspace.collector import ResourceSearchPathCollector
 from sift import __version__
+from sift.util import (WORKSPACE_DB_DIR,
+                       DOCUMENT_SETTINGS_DIR,
+                       get_package_data_dir,
+                       check_grib_definition_dir,
+                       check_imageio_deps)
 
+from glob import glob
 from functools import partial
 
 # this is generated with pyuic4 pov_main.ui >pov_main_ui.py
 from sift.ui.pov_main_ui import Ui_MainWindow
-from sift.common import INFO, KIND, TOOL, COMPOSITE_TYPE
+from sift.common import INFO, KIND, TOOL, COMPOSITE_TYPE, get_font_size
 
 import os
 import sys
 import logging
+from sift.ui.GradientControl import GradientControl
+
+app_object = app.use_app('pyqt4')
+APP: QtGui.QApplication = app_object.native
+LOOP = QEventLoop(APP)
+asyncio.set_event_loop(LOOP)  # NEW must set the event loop
+
+
+QtCore = app_object.backend_module.QtCore
+QtGui = app_object.backend_module.QtGui
 
 
 LOG = logging.getLogger(__name__)
@@ -53,80 +76,67 @@ PROGRESS_BAR_MAX = 1000
 STATUS_BAR_DURATION = 2000  # ms
 
 
-def test_layers_from_directory(ws, doc, layer_tiff_glob, range_txt=None):
-    """
-    TIFF_GLOB='/Users/keoni/Data/CSPOV/2015_07_14_195/00?0/HS*_B03_*merc.tif' VERBOSITY=3 python -m sift
-    :param model:
-    :param view:
-    :param layer_tiff_glob:
-    :return:
-    """
-    from glob import glob
-    range = None
-    if range_txt:
-        import re
-        range = tuple(map(float, re.findall(r'[\.0-9]+', range_txt)))
-    for tif in glob(layer_tiff_glob):
-        # doc.addFullGlobMercatorColormappedFloatImageLayer(tif, range=range)
-        # uuid, info, overview_data = ws.import_image(tif)
-        uuid, info, overview_data = doc.open_file(tif)
-        LOG.info('loaded uuid {} from {}'.format(uuid, tif))
-        yield uuid, info, overview_data
+def test_layers_from_directory(doc, layer_tiff_glob):
+    return doc.open_file(glob(layer_tiff_glob))
 
 
-def test_layers(ws, doc, glob_pattern=None):
+def test_layers(doc, glob_pattern=None):
     if glob_pattern:
-        return test_layers_from_directory(ws, doc, glob_pattern, os.environ.get('RANGE', None))
+        return test_layers_from_directory(doc, glob_pattern)
     return []
 
 
+async def do_test_cycle(txt: QtGui.QWidget):
+    from asyncio import sleep
+    n = 0
+    while True:
+        txt.setText(str(n))
+        await sleep(1)
+        n += 1
+
+
 class OpenCacheDialog(QtGui.QDialog):
-    _paths = None
     _opener = None
     _remover = None
 
-    def __init__(self, parent):
+    def __init__(self, parent, opener, remover):
         super(OpenCacheDialog, self).__init__(parent)
         self.ui = open_cache_dialog_ui.Ui_openFromCacheDialog()
         self.ui.setupUi(self)
         self.ui.cacheListWidget.setSelectionMode(QtGui.QListWidget.ExtendedSelection)
         self.ui.removeFromCacheButton.clicked.connect(self._do_remove)
-
-    def activate(self, paths, opener, remover):
         self._opener = opener
         self._remover = remover
+
+    def activate(self, uuid_to_name):
         self.ui.cacheListWidget.clear()
-        if paths:
-            # don't include <algebraic layer ...> type paths
-            pfx = _common_path_prefix([x for x in paths if x[0] != '<']) or ''
-            self.ui.commonPathLabel.setText("Common prefix: " + pfx)
-            self._paths = {}
-            for path in paths:
-                key = path.replace(pfx, '', 1).strip(os.sep)
-                li = QtGui.QListWidgetItem(key)
-                self.ui.cacheListWidget.addItem(li)
-                self._paths[key] = path
+        # assume uuid_to_name is already an OrderedDict:
+        sorted_items = uuid_to_name.items()
+        # sorted_items = sorted(uuid_to_name.items(),
+        #                       key=lambda x: x[1])
+        for uuid, name in sorted_items:
+            li = QtGui.QListWidgetItem(name)
+            li.setData(QtCore.Qt.UserRole, uuid)
+            self.ui.cacheListWidget.addItem(li)
         self.show()
 
     def _do_remove(self, *args, **kwargs):
-        items = list(self.ui.cacheListWidget.selectedItems())
-        to_remove = [self._paths[x.text()] for x in items]
-        for item in items:
+        to_remove = []
+        for item in self.ui.cacheListWidget.selectedItems():
+            to_remove.append(item.data(QtCore.Qt.UserRole))
             self.ui.cacheListWidget.removeItemWidget(item)
         self._remover(to_remove)
         self.hide()
-        self._doc = self._ws = self._opener = self._paths = None
 
     def accept(self, *args, **kwargs):
         self.hide()
-        to_open = [self._paths[x.text()] for x in self.ui.cacheListWidget.selectedItems()]
+        to_open = [item.data(QtCore.Qt.UserRole)
+                   for item in self.ui.cacheListWidget.selectedItems()]
         LOG.info("opening from cache: " + repr(to_open))
         self._opener(to_open)
-        self._doc = self._ws = self._opener = self._paths = None
 
     def reject(self, *args, **kwargs):
         self.hide()
-        self._doc = self._ws = self._opener = self._paths = None
 
 
 class AnimationSpeedPopupWindow(QtGui.QWidget):
@@ -226,27 +236,63 @@ class Main(QtGui.QMainWindow):
     _animation_speed_popup = None  # window we'll show temporarily with animation speed popup
     _open_cache_dialog = None
     _screenshot_dialog = None
+    _geditor = None # Gradient editor widget
+    _resource_collector: ResourceSearchPathCollector = None
+    _resource_collector_timer: QtCore.QTimer = None
+    _timeline_scene: SiftDocumentAsFramesInTracks = None
 
     def interactive_open_files(self, *args, files=None, **kwargs):
         self.scene_manager.layer_set.animating = False
         # http://pyqt.sourceforge.net/Docs/PyQt4/qfiledialog.html#getOpenFileNames
+        filename_filters = [
+            # 'All files (*.*)',
+            'All supported files (*.nc *.nc4 *.tiff *.tif)',
+            'GOES-16 NetCDF (*.nc *.nc4)',
+            'Mercator GTIFF (*.tiff *.tif)',
+            # 'NWP GRIB2 (*.grib2)',
+        ]
+        filter_str = ';;'.join(filename_filters)
         files = QtGui.QFileDialog.getOpenFileNames(self,
                                                    "Select one or more files to open",
                                                    self._last_open_dir or os.getenv("HOME"),
-                                                   ';;'.join(['GOES-R netCDF or Merc GTIFF (*.nc *.nc4 *.tiff *.tif)']))
+                                                   filter_str)
         self.open_paths(files)
 
-    def open_paths(self, paths):
-        paths = list(paths)
-        if not paths:
-            return
-        for uuid, _, _ in self.document.open_files(paths):
-            pass
+    def _bgnd_open_paths(self, paths, uuid_list, **importer_kwargs):
+        """Background task runs on a secondary thread
+        """
+        LOG.info("opening products from {} paths in background".format(
+            len(paths)))
+        for progress in self.document.import_files(paths, **importer_kwargs):
+            yield progress
+            uuid_list.append(progress['uuid'])
+        yield {TASK_DOING: 'products loaded from paths', TASK_PROGRESS: 1.0}
+
+    def _bgnd_open_paths_finish(self, isok: bool, uuid_list):
+        """Main thread finalization after background imports are done
+        :param isok: whether _bgnd_open_paths ran without exception
+        :param uuid_list: list of UUIDs it generated
+        :return:
+        """
+        if not uuid_list:
+            raise ValueError("no UUIDs provided by background open in _bgnd_open_paths_when_done")
+        if not isok:
+            raise ValueError("background open did not succeed")
+        uuid = uuid_list[-1]
         self.behaviorLayersList.select([uuid])
         # set the animation based on the last added (topmost) layer
         self.document.animate_siblings_of_layer(uuid)
         # force the newest layer to be visible
         self.document.next_last_step(uuid)
+
+    def open_paths(self, paths, **importer_kwargs):
+        paths = list(paths)
+        if not paths:
+            return
+        uli = []
+        bop = partial(self._bgnd_open_paths, uuid_list=uli, **importer_kwargs)
+        bopf = partial(self._bgnd_open_paths_finish, uuid_list=uli)
+        self.queue.add("load_files", bop(paths), "Open {} files".format(len(paths)), and_then=bopf, interactive=False)
         # don't use <algebraic layer ...> type paths
         self._last_open_dir = _common_path_prefix([x for x in paths if x[0] != '<']) or self._last_open_dir
         self.update_recent_file_menu()
@@ -284,23 +330,21 @@ class Main(QtGui.QMainWindow):
         self.scene_manager.change_tool(name)
 
     def update_recent_file_menu(self, *args, **kwargs):
-        paths = self.workspace.recently_used_resource_paths()
-        LOG.debug('recent paths: {}'.format(repr(paths)))
-        paths = self.document.sort_paths(paths)
-        LOG.debug('recent files: {0!r:s}'.format(paths))
+        uuid_to_name = self.workspace.recently_used_products()
+        LOG.debug('recent uuids: {}'.format(repr(uuid_to_name.keys())))
         self._recent_files_menu.clear()
-        for path in paths:
-            def openit(*args, path=path, **kwargs):
-                LOG.debug('open recent file {}'.format(path))
+        for uuid, p_name in uuid_to_name.items():
+            def openit(checked=False, uuid=uuid):
+                LOG.debug('open recent product {}'.format(uuid))
                 self.scene_manager.layer_set.animating = False
-                self.document.open_file(path)
-            open_action = QtGui.QAction(os.path.split(path)[1], self)
+                self.activate_products_by_uuid([uuid])
+            open_action = QtGui.QAction(p_name, self)
             open_action.triggered.connect(openit)
             self._recent_files_menu.addAction(open_action)
 
     def update_progress_bar(self, status_info, *args, **kwargs):
         active = status_info[0] if len(status_info)>0 else None
-        LOG.debug('{0!r:s}'.format(status_info))
+        # LOG.debug('{0!r:s}'.format(status_info))
         val = active[TASK_PROGRESS] if active else 0.0
         txt = active[TASK_DOING] if active else ''
         val = self.queue.progress_ratio(val)
@@ -341,8 +385,45 @@ class Main(QtGui.QMainWindow):
 
     def remove_layer(self, *args, **kwargs):
         uuids = self.behaviorLayersList.current_selected_uuids()
-        if uuids:
-            self.document.remove_layers_from_all_sets(uuids)
+        rgb_uuids_handled = set()
+        uuids_to_remove = set()
+        # if we are deleting an RGB layer then we have to remove all of them
+        uuids = list(uuids)
+        for uuid in uuids:
+            layer = self.document[uuid]
+            if not isinstance(layer, DocRGBLayer):
+                uuids_to_remove.add(uuid)
+                continue
+            elif uuid in rgb_uuids_handled:
+                continue
+
+            rgbs_uuids = self.document.family_uuids_for_uuid(uuid, active_only=True)
+            all_rgbs_uuids = self.document.family_uuids_for_uuid(uuid)
+            if all(l_uuid in uuids for l_uuid in rgbs_uuids):
+                # there is only one of these RGBs so just remove it
+                # or they have selected all of the layers in this family
+                rgb_uuids_handled.update(all_rgbs_uuids)
+                uuids_to_remove.update(all_rgbs_uuids)
+                continue
+
+            # Ask the user if this is what they want
+            msg_box = QtGui.QMessageBox()
+            msg_box.setText("Deleting RGB layer, delete all times for this RGB?")
+            msg_box.setInformativeText("All related RGBs must also be deleted.")
+            msg_box.setStandardButtons(msg_box.Yes | msg_box.No)
+            msg_box.setDefaultButton(msg_box.No)
+            response = msg_box.exec_()
+            if response == msg_box.Yes:
+                LOG.debug("Setting all RGB family UUIDs to be removed: %s", uuid)
+                rgb_uuids_handled.update(all_rgbs_uuids)
+                uuids_to_remove.update(all_rgbs_uuids)
+            else:
+                LOG.debug("Will not delete RGB or its family: %s", uuid)
+                rgb_uuids_handled.update(all_rgbs_uuids)
+                continue
+
+        if uuids_to_remove:
+            self.document.remove_layers_from_all_sets(uuids_to_remove)
 
     def animation_slider_jump_frame(self, event, *args, **kwargs):
         "user has moved frame slider, update the display"
@@ -442,22 +523,6 @@ class Main(QtGui.QMainWindow):
     #         self.animation_slider_jump_frame(None)
     #         self.behaviorLayersList.select([info[INFO.UUID]])
 
-    def _user_set_rgb_layer(self, uuid:UUID, rgba:str, selected:DocLayer):
-        """
-        handle signal from layer info panel which says that an RGB layer selected a new layer as channel
-        :param layer: layer being edited
-        :param rgba: char from 'rgba'
-        :param selected: layer to replace, causing scene graph element to be rebuilt
-        :return:
-        """
-        # we could just modify the layer and emit the document signal, but preference is to have document generate its own signals.
-        layer = self.document[uuid]
-        self.document.change_rgb_component_layer(layer, **{rgba:selected})
-
-    def _user_set_rgb_range(self, uuid:UUID, rgba:str, lo:float, hi:float):
-        layer = self.document[uuid]
-        self.document.set_rgb_range(layer, rgba, lo, hi)
-
     def _refresh_probe_results(self, *args):
         arg1 = args[0]
         if isinstance(arg1, dict):
@@ -482,11 +547,11 @@ class Main(QtGui.QMainWindow):
             lon, lat = xy_pos
             lon = lon % 360 if lon > 0 else lon % -360 + 360
             lon = lon - 360 if lon > 180 else lon
-            lon_str = "{:.02f} {}".format(abs(lon), "W" if lon < 0 else "E")
-            lat_str = "{:.02f} {}".format(abs(lat), "S" if lat < 0 else "N")
-            self.ui.cursorProbeLocation.setText("Probe Location: {}, {}".format(lon_str, lat_str))
+            lon_str = "{:>6.02f} {}".format(abs(lon), "W" if lon < 0 else "E")
+            lat_str = "{:>6.02f} {}".format(abs(lat), "S" if lat < 0 else "N")
+            probe_loc = "{}, {}".format(lon_str, lat_str)
         else:
-            self.ui.cursorProbeLocation.setText("Probe Location: N/A")
+            probe_loc = "{:>6s}  , {:>6s}  ".format("N/A", "N/A")
 
         if animating:
             data_str = "<animating>"
@@ -499,21 +564,81 @@ class Main(QtGui.QMainWindow):
 
             if data_point is None:
                 data_str = "N/A"
+                layer_str = "N/A"
             else:
-                unit_info = self.document[uuid][INFO.UNIT_CONVERSION]
+                info = self.document[uuid]
+                unit_info = info[INFO.UNIT_CONVERSION]
                 data_point = unit_info[1](data_point)
                 data_str = unit_info[2](data_point, numeric=False)
+                if info.get(INFO.CENTRAL_WAVELENGTH):
+                    wl = info[INFO.CENTRAL_WAVELENGTH]
+                    if wl < 4.1:
+                        wl_str = "{:0.02f} µm".format(wl)
+                    else:
+                        wl_str = "{:0.01f} µm".format(wl)
+                    layer_str = "{}, {}".format(info[INFO.SHORT_NAME],
+                                                wl_str)
+                else:
+                    layer_str = info[INFO.SHORT_NAME]
         else:
             data_str = "N/A"
-        self.ui.cursorProbeText.setText("Probe Value: {} ".format(data_str))
+            layer_str = "N/A"
+        self.ui.cursorProbeLayer.setText(layer_str)
+        self.ui.cursorProbeText.setText("{} ({})".format(data_str, probe_loc))
 
-    def __init__(self, workspace_dir=None, workspace_size=None, glob_pattern=None, border_shapefile=None, center=None):
+    def _init_timeline(self, doc: Document, ws: Workspace):
+        gv = self.ui.timelineView
+
+        # set up the widget itself
+        from PyQt4.QtOpenGL import QGLFormat, QGL, QGLWidget
+        fmt = QGLFormat(QGL.SampleBuffers)
+        wdgt = QGLWidget(fmt)
+        assert(wdgt.isValid())
+        gv.setViewport(wdgt)
+        gv.setViewportUpdateMode(QtGui.QGraphicsView.FullViewportUpdate)
+        gv.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOn)
+        gv.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        gv.setRenderHints(QtGui.QPainter.Antialiasing)
+
+        # connect up the scene
+        doc.sync_potential_tracks_from_metadata()
+        LOG.debug("Potential tracks: {}".format(repr(doc.track_order)))
+        self._timeline_scene = SiftDocumentAsFramesInTracks(doc, self.workspace)
+        gv.setScene(self._timeline_scene)
+        APP.aboutToQuit.connect(self._timeline_scene.clear)
+
+        self._timeline_scene.sync_items()
+
+        def center_timeline_view_on_single_frame(frame_uuids, gv=gv, timeline_scene=self._timeline_scene):
+            frame_uuids = list(frame_uuids) if not isinstance(frame_uuids, list) else frame_uuids
+            # FIXME: again, we're assuming product id = frame id = layer id
+            if len(frame_uuids) == 1 and gv.isVisible():
+                LOG.debug('centering timeline view on single selected frame')
+
+                timeline_scene.center_view_on_frame(gv, frame_uuids[0])
+
+        self.layer_list_model.uuidSelectionChanged.connect(center_timeline_view_on_single_frame)
+
+
+    def __init__(self, config_dir=None, cache_dir=None, cache_size=None, glob_pattern=None, search_paths=None, border_shapefile=None, center=None):
         super(Main, self).__init__()
         self.ui = Ui_MainWindow()
         self.ui.setupUi(self)
+        # FIXME: Slider does not currently work as intended. Re-enable later
+        self.ui.timelineScaleSlider.setDisabled(True)
+
+        # hack some font sizes until we migrate to PyQt5 and handle it better
+        # was 14 on osx
+        fsize = get_font_size(8.2)
+        font = QtGui.QFont('Andale Mono')
+        font.setPointSizeF(fsize)
+        self.ui.cursorProbeLayer.setFont(font)
+        self.ui.cursorProbeText.setFont(font)
+
         self.setWindowTitle(self.windowTitle().replace("|X.X.X|", __version__))
         self.tabifyDockWidget(self.ui.layersPane, self.ui.areaProbePane)
         self.tabifyDockWidget(self.ui.layerDetailsPane, self.ui.rgbConfigPane)
+        self.tabifyDockWidget(self.ui.layerDetailsPane, self.ui.timelinePane)
 
         # self.tabifyDockWidget(self.ui.rgbConfigPane, self.ui.layerDetailsPane)
         # Make the layer list and layer details shown
@@ -527,8 +652,8 @@ class Main(QtGui.QMainWindow):
         self.queue.didMakeProgress.connect(self.update_progress_bar)
 
         # create manager and helper classes
-        self.workspace = Workspace(workspace_dir, max_size_gb=workspace_size, queue=self.queue)
-        self.document = doc = Document(self.workspace)
+        self.workspace = Workspace(cache_dir, max_size_gb=cache_size, queue=self.queue)
+        self.document = doc = Document(self.workspace, config_dir=config_dir, queue=self.queue)
         self.scene_manager = SceneGraphManager(doc, self.workspace, self.queue,
                                                border_shapefile=border_shapefile,
                                                center=center,
@@ -564,24 +689,37 @@ class Main(QtGui.QMainWindow):
             pane.setFeatures(QtGui.QDockWidget.DockWidgetFloatable |
                              QtGui.QDockWidget.DockWidgetMovable)
 
-        for uuid, ds_info, full_data in test_layers(self.workspace, self.document, glob_pattern=glob_pattern):
-            # this now fires off a document modification cascade resulting in a new layer going up
-            pass
+        test_layers(self.document, glob_pattern=glob_pattern)
+
+        # quamash async test pattern updates a control once a second
+        # loop.create_task(do_test_cycle(self.ui.cursorProbeText))
 
         # Interaction Setup
         self.setup_key_releases()
         self.scheduler = QtCore.QTimer(parent=self)
         self.scheduler.setInterval(200.0)
         self.scheduler.timeout.connect(partial(self.scene_manager.on_view_change, self.scheduler))
+
         def start_wrapper(timer, event):
             """Simple wrapper around a timers start method so we can accept but ignore the event provided
             """
             timer.start()
-        self.scene_manager.main_canvas.transforms.changed.connect(partial(start_wrapper, self.scheduler))
+
+        self.scene_manager.main_view.scene.transform.changed.connect(partial(start_wrapper, self.scheduler))
 
         # convey action between document and layer list view
-        self.layerSetsManager = LayerSetsManager(self.ui, self.ui.layerSetTabs, self.ui.layerDetailsContents, self.document)
-        self.behaviorLayersList = self.layerSetsManager.getLayerStackListViewModel()
+        self.layer_info_pane = SingleLayerInfoPane(self.ui.layerDetailsContents, self.document)
+        self.layer_list_model = LayerStackTreeViewModel([self.ui.layerListView], self.document,
+                                                        parent=self.ui.layersPaneWidget)
+        self.layer_list_model.uuidSelectionChanged.connect(self.layer_info_pane.update_display)
+        self.behaviorLayersList = self.layer_list_model  # historical naming
+
+        self.rgb_config_pane = RGBLayerConfigPane(self.ui, self.ui.layersPaneWidget)
+        self.user_rgb_behavior = UserModifiesRGBLayers(self.document,
+                                                       self.rgb_config_pane,
+                                                       self.layer_list_model,
+                                                       parent=self)
+
         def update_probe_polygon(uuid, points, layerlist=self.behaviorLayersList):
             top_uuids = list(self.document.current_visible_layer_uuids)
             LOG.debug("top visible UUID is {0!r:s}".format(top_uuids))
@@ -603,18 +741,11 @@ class Main(QtGui.QMainWindow):
 
         self.scene_manager.newProbePolygon.connect(update_probe_polygon)
 
-        # setup RGB configuration : FIXME clean this up into a behavior
-        self.layerSetsManager.didChangeRGBLayerComponentRange.connect(self._user_set_rgb_range)
-        self.layerSetsManager.didChangeRGBLayerSelection.connect(self._user_set_rgb_layer)
+        # setup RGB configuration
         self.document.didChangeComposition.connect(lambda *args: self._refresh_probe_results(*args[1:]))
         self.document.didChangeColorLimits.connect(self._refresh_probe_results)
 
-        # self.queue.add('test', test_task(), 'test000')
-        # self.ui.layers
         print(self.scene_manager.main_view.describe_tree(with_transform=True))
-        # self.document.didChangeColormap.connect(self.scene_manager.change_layers_colormap)
-        # self.document.didChangeColorLimits.connect(self.scene_manager.change_layers_color_limits)
-        # self.document.didChangeGamma.connect(self.scene_manager.change_layers_gamma)
         self.document.didSwitchLayerSet.connect(self.animation_reset_by_layer_set_switch)
 
         self.document.didChangeLayerVisibility.connect(self.update_frame_time_to_top_visible)
@@ -663,6 +794,35 @@ class Main(QtGui.QMainWindow):
         self.document.change_projection()
         self.ui.projectionComboBox.setCurrentIndex(self.document.current_projection_index())
 
+        # if search paths are provided on the command line,
+        self._resource_collector = collector = ResourceSearchPathCollector(self.workspace)
+        collector.paths = search_paths or []
+        # periodically launch a background scan
+        self._resource_collector_timer = timer = QtCore.QTimer()
+        self._timer_collect_resources()
+        timer.timeout.connect(self._timer_collect_resources)
+        timer.start(60000)
+
+        # set up timeline
+        LOG.info("potential tracks already in database: {}".format(repr(doc.potential_tracks())))
+        self._init_timeline(doc, self.workspace)
+
+        # FIXME: make sure sync of metadata signals sync of document potentials and track display
+
+    def _timer_collect_resources(self):
+        if self._resource_collector:
+            LOG.debug("launching background resource search")
+            self.queue.add('resource_find', self._resource_collector.bgnd_look_for_new_files(), "look for new or modified files",
+                           and_then=self._finish_collecting_resources, interactive=False)
+
+    def _finish_collecting_resources(self, previous_stage_ok:bool = True):
+        ntodo = self._resource_collector.has_pending_files
+        if ntodo:
+            LOG.debug("{} new resources to collect metadata from".format(ntodo))
+            self.queue.add("resource_collect", self._resource_collector.bgnd_merge_new_file_metadata_into_mdb(), "add metadata for newly found files", interactive=False)
+        else:
+            LOG.debug("no resources to collect, skipping followup task")
+
     def closeEvent(self, event, *args, **kwargs):
         LOG.debug('main window closing')
         self.workspace.close()
@@ -676,28 +836,24 @@ class Main(QtGui.QMainWindow):
         self.update_recent_file_menu()
 
     def open_from_cache(self, *args, **kwargs):
-        if not self._open_cache_dialog:
-            self._open_cache_dialog = OpenCacheDialog(self)
-        name_to_uuid = self.workspace.product_names_available_in_cache
-        resource_names_for_uuids = list(name_to_uuid.keys())
-        paths = self.document.sort_paths(resource_names_for_uuids)
-
-        def _activate_products_for_names(names):
-            names = list(names)
-            LOG.debug("names to re-activate: {}".format(repr(names)))
-            uuids = [name_to_uuid[path] for path in names]
+        def _activate_products_for_names(uuids):
             LOG.info('activating cached products with uuids: {}'.format(repr(uuids)))
             self.activate_products_by_uuid(uuids)
 
-        def _purge_content_for_names(names):
-            names = list(names)
-            LOG.debug("names to purge: {}".format(repr(names)))
-            uuids = [name_to_uuid[path] for path in names]
+        def _purge_content_for_names(uuids):
             LOG.info('removing cached products with uuids: {}'.format(repr(uuids)))
-            self.workspace.purge_content_for_product_uuids(uuids)
+            self.workspace.purge_content_for_product_uuids(uuids, also_products=False)
             self.update_recent_file_menu()
 
-        self._open_cache_dialog.activate(paths, _activate_products_for_names, _purge_content_for_names)
+        if not self._open_cache_dialog:
+            self._open_cache_dialog = OpenCacheDialog(self,
+                                                      _activate_products_for_names,
+                                                      _purge_content_for_names)
+
+        uuid_to_name = self.workspace.product_names_available_in_cache
+        ordered_uuids = self.document.sort_product_uuids(uuid_to_name.keys())
+        ordered_uuid_to_name = OrderedDict([(u, uuid_to_name[u]) for u in ordered_uuids])
+        self._open_cache_dialog.activate(ordered_uuid_to_name)
 
     def open_glob(self, *args, **kwargs):
         text, ok = QtGui.QInputDialog.getText(self, 'Open Glob Pattern',
@@ -706,6 +862,23 @@ class Main(QtGui.QMainWindow):
         if ok:
             paths = list(glob(text))
             self.open_paths(paths)
+
+    def open_wizard(self, *args, **kwargs):
+        from sift.view.open_file_wizard import OpenFileWizard
+        wizard_dialog = OpenFileWizard(base_dir=self._last_open_dir, parent=self)
+        if wizard_dialog.exec_():
+            LOG.info("Loading products from open wizard...")
+            scenes = wizard_dialog.scenes
+            reader = list(list(scenes.values())[0].readers.keys())[0]
+            importer_kwargs = {
+                'reader': reader,
+                'scenes': scenes,
+                'dataset_ids': wizard_dialog.selected_ids,
+            }
+            self.open_paths(wizard_dialog._selected_files,
+                            **importer_kwargs)
+        else:
+            LOG.debug("Wizard closed, nothing to load")
 
     def remove_region_polygon(self, action:QtGui.QAction=None, *args):
         if self.scene_manager.has_pending_polygon():
@@ -716,19 +889,6 @@ class Main(QtGui.QMainWindow):
         removed_name = self.graphManager.currentPolygonChanged(None)
         LOG.info("Clearing polygon with name '%s'", removed_name)
         self.scene_manager.remove_polygon(removed_name)
-
-    def create_composite(self, action:QtGui.QAction=None, uuids=[], composite_type=COMPOSITE_TYPE.RGB):
-        if composite_type not in [COMPOSITE_TYPE.RGB]:
-            raise ValueError("Unknown or unimplemented composite type: %s" % (composite_type,))
-        if len(uuids) == 0:
-            # get the layers to composite from current selection
-            uuids = list(self.behaviorLayersList.current_selected_uuids())
-        if len(uuids)<3:  # pad with None
-            uuids = uuids + ([None] * (3 - len(uuids)))
-        # Don't use non-basic layers as starting points for the new composite
-        uuids = [uuid if uuid is not None and self.document[uuid][INFO.KIND] in [KIND.IMAGE, KIND.COMPOSITE] else None for uuid in uuids]
-        layer = self.document.create_rgb_composite(uuids[0], uuids[1], uuids[2])
-        self.behaviorLayersList.select([layer.uuid])
 
     def create_algebraic(self, action:QtGui.QAction=None, uuids=None, composite_type=COMPOSITE_TYPE.ARITHMETIC):
         if uuids is None:
@@ -755,11 +915,16 @@ class Main(QtGui.QMainWindow):
         open_glob_action.setShortcut("Ctrl+Shift+O")
         open_glob_action.triggered.connect(self.open_glob)
 
+        open_wizard_action = QtGui.QAction("Open File Wizard...", self)
+        open_wizard_action.setShortcut("Ctrl+Alt+O")
+        open_wizard_action.triggered.connect(self.open_wizard)
+
         menubar = self.ui.menubar
         file_menu = menubar.addMenu('&File')
         file_menu.addAction(open_action)
         file_menu.addAction(open_cache_action)
         file_menu.addAction(open_glob_action)
+        file_menu.addAction(open_wizard_action)
         self._recent_files_menu = file_menu.addMenu('Open Recent')
 
         screenshot_action = QtGui.QAction("Export Image", self)
@@ -827,7 +992,7 @@ class Main(QtGui.QMainWindow):
 
         composite = QtGui.QAction("Create Composite", self)
         composite.setShortcut('C')
-        composite.triggered.connect(self.create_composite)
+        composite.triggered.connect(self.user_rgb_behavior.create_rgb)
 
         algebraic = QtGui.QAction("Create Algebraic", self)
         algebraic.triggered.connect(self.create_algebraic)
@@ -836,10 +1001,15 @@ class Main(QtGui.QMainWindow):
         toggle_point.setShortcut('X')
         toggle_point.triggered.connect(lambda: self.graphManager.toggle_point_probe(DEFAULT_POINT_PROBE))
 
+        open_gradient = QtGui.QAction("Toggle Gradient Editor", self)
+        open_gradient.setShortcut("Ctrl+E")
+        open_gradient.triggered.connect(self.openGradientWidget)
+
         edit_menu = menubar.addMenu('&Edit')
         edit_menu.addAction(remove)
         edit_menu.addAction(clear)
         edit_menu.addAction(toggle_point)
+        edit_menu.addAction(open_gradient)
 
         layer_menu = menubar.addMenu('&Layer')
         layer_menu.addAction(composite)
@@ -874,56 +1044,17 @@ class Main(QtGui.QMainWindow):
         # self.ui.layers.add
         pass
 
+    def openGradientWidget(self):
+        if self._geditor is None:
+            self._geditor = GradientControl(doc=self.document)
 
-def main():
-    if "win" in sys.platform:
-        # Windows AND Mac/OSX
-        default_workspace = os.path.expanduser(os.path.join("~", "Documents", "sift_workspace"))
-    else:
-        default_workspace = os.path.expanduser(os.path.join("~", "sift_workspace"))
+        self._geditor.show()
 
-    import argparse
-    parser = argparse.ArgumentParser(description="Run CSPOV")
-    parser.add_argument("-w", "--workspace", default=default_workspace,
-                        help="Specify workspace base directory")
-    parser.add_argument("-s", "--space", default=256, type=int,
-                        help="Specify max amount of data to hold in workspace in Gigabytes")
-    parser.add_argument("--border-shapefile", default=None,
-                        help="Specify alternative coastline/border shapefile")
-    parser.add_argument("--glob-pattern", default=os.environ.get("TIFF_GLOB", None),
-                        help="Specify glob pattern for input images")
-    parser.add_argument("-c", "--center", nargs=2, type=float,
-                        help="Specify center longitude and latitude for camera")
-    parser.add_argument("--desktop", type=int, default=0,
-                        help="Number of monitor/display to show the main window on (0 for main, 1 for secondary, etc.)")
-    parser.add_argument('-v', '--verbose', dest='verbosity', action="count", default=int(os.environ.get("VERBOSITY", 2)),
-                        help='each occurrence increases verbosity 1 level through ERROR-WARNING-INFO-DEBUG (default INFO)')
-    args = parser.parse_args()
 
-    levels = [logging.ERROR, logging.WARN, logging.INFO, logging.DEBUG]
-    level=levels[min(3, args.verbosity)]
-    logging.basicConfig(level=level)
-    # FIXME: This is needed because shapely 1.5.11 sucks
-    logging.getLogger().setLevel(level)
-    # logging.getLogger('vispy').setLevel(level)
-
-    if not os.path.exists(args.workspace):
-        LOG.info("Creating SIFT Workspace: %s", args.workspace)
-        os.makedirs(args.workspace)
-    else:
-        LOG.info("Using SIFT Workspace: %s", args.workspace)
-
-    app.create()
-    # app = QApplication(sys.argv)
-    window = Main(
-        workspace_dir=args.workspace,
-        workspace_size=args.space,
-        glob_pattern=args.glob_pattern,
-        border_shapefile=args.border_shapefile,
-        center=args.center,
-    )
+def set_default_geometry(window, desktop=0):
     screen = QtGui.QApplication.desktop()
-    screen_geometry = screen.screenGeometry(args.desktop)
+    screen_geometry = screen.screenGeometry(desktop)
+    # TODO: Remove platform specific code
     if 'darwin' not in sys.platform:
         w, h = screen_geometry.width() - 400, screen_geometry.height() - 300
         window.setGeometry(200, 150, w, h)
@@ -935,10 +1066,80 @@ def main():
         window.move(int(screen_x - w / 2.), int(screen_y - h / 2.))
 
 
+def _search_paths(arglist):
+    for arg in arglist:
+        for subpath in arg.split(':'):
+            yield subpath
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Run SIFT")
+    parser.add_argument("-w", "--workspace",
+                        help="(DEPRECATED) Specify workspace base directory")
+    parser.add_argument("--cache-dir", default=WORKSPACE_DB_DIR,
+                        help="Specify cache directory")
+    parser.add_argument("--config-dir", default=DOCUMENT_SETTINGS_DIR,
+                        help="Specify config directory")
+    parser.add_argument("-s", "--space", default=256, type=int,
+                        help="Specify max amount of data to hold in workspace cache in Gigabytes")
+    parser.add_argument("--border-shapefile", default=None,
+                        help="Specify alternative coastline/border shapefile")
+    parser.add_argument("--glob-pattern", default=os.environ.get("TIFF_GLOB", None),
+                        help="Specify glob pattern for input images")
+    parser.add_argument('-p', '--path', dest='paths', action="append",
+                        help='directory to search for data [MULTIPLE ALLOWED]')
+    parser.add_argument("-c", "--center", nargs=2, type=float,
+                        help="Specify center longitude and latitude for camera")
+    parser.add_argument("--desktop", type=int, default=0,
+                        help="Number of monitor/display to show the main window on (0 for main, 1 for secondary, etc.)")
+    parser.add_argument('-v', '--verbose', dest='verbosity', action="count", default=int(os.environ.get("VERBOSITY", 2)),
+                        help='each occurrence increases verbosity 1 level through ERROR-WARNING-INFO-DEBUG (default INFO)')
+    args = parser.parse_args()
+
+    levels = [logging.ERROR, logging.WARN, logging.INFO, logging.DEBUG]
+    level = levels[min(3, args.verbosity)]
+    logging.basicConfig(level=level, datefmt='%H:%M:%S',
+                        format='%(levelname)s %(asctime)s %(module)s:%(funcName)s:L%(lineno)d %(message)s')
+    # FIXME: This is needed because shapely 1.5.11 sucks
+    logging.getLogger().setLevel(level)
+    check_grib_definition_dir()
+    check_imageio_deps()
+    # logging.getLogger('vispy').setLevel(level)
+
+    if args.workspace:
+        LOG.warning("'--workspace' is deprecated, use '--cache-dir'")
+        args.config_dir = args.workspace
+        args.cache_dir = (args.workspace, args.workspace)
+
+    LOG.info("Using configuration directory: %s", args.config_dir)
+    LOG.info("Using cache directory: %s", args.cache_dir)
+    app.create()
+
+    # Add our own fonts to Qt windowing system
+    font_pattern = os.path.join(get_package_data_dir(), 'fonts', '*')
+    for fn in glob(font_pattern):
+        QtGui.QFontDatabase.addApplicationFont(fn)
+
+    data_search_paths = [] if not args.paths else list(_search_paths(args.paths))
+    LOG.info("will search {} for new data periodically".format(repr(data_search_paths)))
+
+    window = Main(
+        cache_dir=args.cache_dir,
+        config_dir=args.config_dir,
+        cache_size=args.space,
+        glob_pattern=args.glob_pattern,
+        search_paths = data_search_paths,
+        border_shapefile=args.border_shapefile,
+        center=args.center,
+    )
+
+    set_default_geometry(window, desktop=args.desktop)
     window.show()
     # bring window to front
     window.raise_()
-    app.run()
+    LOOP.run_forever()
+    # app.run()
 
 if __name__ == '__main__':
     sys.exit(main())

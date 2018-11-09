@@ -14,28 +14,13 @@ build:
   # If this is a new build for the same version, increment the build
   # number. If you do not include this key, it defaults to 0.
   number: 0
+  script: python -m pip install --no-deps --ignore-installed .
 
 requirements:
-  build:
-    - python >=3.6
+  host:
+    - python {{PY_VER}}*,>=3.6
     - setuptools
-    - numpy >=1.12
-    - gdal >=2.1,<2.2
-    - rasterio
-    - matplotlib
-    - scipy
-    - numba >=0.30
-    - pyproj >=1.9.4
-    - vispy ==0.5.0dev2
-    - goesr >=0.4.2 # via Ray Garcia, on sift channel
-    - pyopengl
-    - netcdf4
-    - h5py
-    - pillow
-    - pyshp
-    - shapely
-    - sqlalchemy
-    - pyqt <5
+    - pip
     - cython >=0.17 # [win]
     # this is only needed because of a weird bug with netcdf4
     # https://github.com/conda-forge/netcdf4-feedstock/issues/33
@@ -43,23 +28,34 @@ requirements:
 
   run:
     - python >=3.6
+    - setuptools
+    - pip
     - numpy >=1.12
-    - gdal >=2.1,<2.2
+    - gdal
+    - hdf5
     - rasterio
     - matplotlib
     - scipy
     - numba >=0.30
     - pyproj >=1.9.4
-    - vispy ==0.5.0dev2
+    - vispy >=0.6.0.dev0
     - goesr >=0.4.2 # via Ray Garcia, on sift channel
     - pyopengl
     - netcdf4
     - h5py
+    - imageio
+    - ffmpeg
     - pillow
     - pyshp
+    - pyqtgraph
     - shapely
     - sqlalchemy
     - pyqt <5
+    - appdirs
+    - pyyaml
+    - quamash
+    - satpy
+    - pygrib  # [not win]
 
 test:
   commands:
@@ -77,3 +73,4 @@ about:
 # See
 # http://docs.continuum.io/conda/build.html for
 # more information about meta.yaml
+
