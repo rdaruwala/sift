@@ -6,6 +6,7 @@ from PyInstaller.utils.hooks import collect_submodules
 import vispy.glsl
 import vispy.io
 import satpy
+import distributed
 
 block_cipher = None
 exe_name = "SIFT"
@@ -16,9 +17,11 @@ data_files = [
     (os.path.dirname(vispy.glsl.__file__), os.path.join("vispy", "glsl")),
     (os.path.join(os.path.dirname(vispy.io.__file__), "_data"), os.path.join("vispy", "io", "_data")),
     (os.path.join(os.path.dirname(satpy.__file__), "etc"), os.path.join('satpy', 'etc')),
+    (os.path.join(os.path.dirname(distributed.__file__)), 'distributed'),
 ]
 
-for shape_dir in ["ne_50m_admin_0_countries", "ne_110m_admin_0_countries", "ne_50m_admin_1_states_provinces_lakes", "fonts", "colormaps"]:
+for shape_dir in ["ne_50m_admin_0_countries", "ne_110m_admin_0_countries", "ne_50m_admin_1_states_provinces_lakes",
+                  "fonts", "colormaps", "grib_definitions"]:
     data_files.append((os.path.join("sift", "data", shape_dir), os.path.join("sift_data", shape_dir)))
 
 hidden_imports = [
@@ -55,7 +58,7 @@ if not is_win:
     share_dir = sys.executable.replace(os.path.join("bin", "python"), "share")
     lib_dir = sys.executable.replace(os.path.join("bin", "python"), "lib")
     bin_dir = sys.executable.replace(os.path.join("bin", "python"), "bin")
-    data_files.append((os.path.join(share_dir, 'grib_api'), os.path.join('share', 'grib_api')))
+    data_files.append((os.path.join(share_dir, 'eccodes'), os.path.join('share', 'eccodes')))
     # Add ffmpeg
     binaries += [(os.path.join(bin_dir, 'ffmpeg'), '.')]
 else:
@@ -121,4 +124,5 @@ if is_darwin:
                  bundle_identifier=None,
                  info_plist={
                      'LSBackgroundOnly': 'false',
+                     'NSHighResolutionCapable': 'True',
                  })

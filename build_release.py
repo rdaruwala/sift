@@ -66,7 +66,7 @@ import shutil
 import logging
 import subprocess
 from glob import glob
-from sift import version
+from uwsift import version
 
 if sys.version_info < (3, 5):
     run = subprocess.check_call
@@ -77,12 +77,12 @@ else:
 log = logging.getLogger(__name__)
 
 SIFT_CHANNEL = "http://larch.ssec.wisc.edu/channels/sift"
-CONDA_RECIPE = os.path.join('conda-recipe', 'sift')
+CONDA_RECIPE = os.path.join('conda-recipe', 'uwsift')
 CHANNEL_HOST = os.environ.get("SIFT_CHANNEL_HOST", "larch")
 CHANNEL_PATH = os.environ.get("SIFT_CHANNEL_PATH", "/var/apache/larch/htdocs/channels/sift")
 # server that is allowed to add to FTP site
 FTP_HOST = os.environ.get("SIFT_FTP_HOST", "bumi")
-FTP_HOST_PATH = os.environ.get("SIFT_FTP_HOST_PATH", "repos/git/sift/dist")
+FTP_HOST_PATH = os.environ.get("SIFT_FTP_HOST_PATH", "repos/git/uwsift/dist")
 FTP_PATH = os.environ.get("SIFT_FTP_PATH", "pub/sift/dist")
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 DIST_DIR = os.path.join(SCRIPT_DIR, 'dist')
@@ -120,7 +120,7 @@ def _build_conda(python_version, output_dir=DIST_DIR):
     run(CONDA_BUILD_CMD.split(' '))
     # check for build revisision
     for i in range(4, -1, -1):
-        f = os.path.join(DIST_DIR, CONDA_PLAT[platform], 'sift-{}-*{}.tar.bz2'.format(version.__version__, i))
+        f = os.path.join(DIST_DIR, CONDA_PLAT[platform], 'uwsift-{}-*{}.tar.bz2'.format(version.__version__, i))
         glob_results = glob(f)
         if len(glob_results) == 1:
             log.info("Conda package name is: %s", glob_results[0])
@@ -141,14 +141,15 @@ def _ssh(host, command):
 
 def _run_pyinstaller():
     log.info("Building installer...")
-    run("pyinstaller -y sift.spec".split(' '))
+    shutil.rmtree(os.path.join('dist', 'SIFT'), ignore_errors=True)
+    run("pyinstaller --clean -y sift.spec".split(' '))
 
 
 def package_installer_osx():
     os.chdir('dist')
     vol_name = "SIFT_{}".format(version.__version__)
     dmg_name = vol_name + ".dmg"
-    run("hdiutil create -volname {} -srcfolder SIFT.app -ov -format UDZO {}".format(vol_name, dmg_name).split(' '))
+    run("hdiutil create -volname {} -fs HFS+ -srcfolder SIFT.app -ov -format UDZO {}".format(vol_name, dmg_name).split(' '))
     return dmg_name
 
 
@@ -160,7 +161,11 @@ def package_installer_linux():
 
 
 def package_installer_win():
-    run([ISCC_PATH, "sift.iss"])
+    from uwsift.util.default_paths import WORKSPACE_DB_DIR, DOCUMENT_SETTINGS_DIR
+    new_env = os.environ.copy()
+    new_env['WORKSPACE_DB_DIR'] = WORKSPACE_DB_DIR
+    new_env['DOCUMENT_SETTINGS_DIR'] = DOCUMENT_SETTINGS_DIR
+    run([ISCC_PATH, "uwsift.iss"], env=new_env)
     vol_name = "SIFT_{}.exe".format(version.__version__)
     vol_name = os.path.join('sift_inno_setup_output', vol_name)
     old_name = os.path.join('sift_inno_setup_output', 'setup.exe')
@@ -184,7 +189,7 @@ def main():
                         help="Don't upload conda package to local channel server")
     parser.add_argument('--no-conda-index', dest='index_conda', action='store_false',
                         help="Don't update remote conda index")
-    parser.add_argument('--python', default="3.6",
+    parser.add_argument('--python', default="3.7",
                         help="Specify what version of python to build the conda package for (see conda-build "
                              "documentation.)")
     parser.add_argument('--no-installer', dest='build_installer', action='store_false',
